@@ -1,0 +1,1478 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ubuntu@sandbox-vm: ~</title>
+<meta name="description" content="A local, offline Ubuntu terminal simulator that runs Bash commands and plain English requests entirely in your browser.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' rx='3' fill='%23300a24'/><circle cx='8' cy='8' r='5' fill='none' stroke='%238ae234' stroke-width='2'/></svg>">
+
+<style>
+  /* ---------- Theme tokens ---------- */
+  :root {
+    --aubergine: #2c001e;
+    --panel: #300a24;
+    --panel-edge: #4a1236;
+    --header: #1d1d20;
+    --header-edge: #0d0d0f;
+    --text: #eeeeec;
+    --muted: #9a8f96;
+    --green: #8ae234;
+    --blue: #729fcf;
+    --red: #ef2929;
+    --yellow: #fce94f;
+    --cyan: #34e2e2;
+    --magenta: #ad7fa8;
+    --gray: #888a85;
+    --white: #ffffff;
+    --close: #df4b33;
+    --minimize: #f0c442;
+    --maximize: #67a637;
+    --font-mono: 'Ubuntu Mono', 'UbuntuMono', Consolas, 'DejaVu Sans Mono', 'Liberation Mono', Menlo, Monaco, monospace;
+    --font-ui: 'Ubuntu', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+    --pad-x: clamp(12px, 2.2vw, 30px);
+    --pad-y: clamp(10px, 1.8vw, 24px);
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    height: 100%;
+    margin: 0;
+  }
+
+  body {
+    display: grid;
+    place-items: center;
+    padding: clamp(8px, 2vw, 28px);
+    background-color: var(--aubergine);
+    background-image:
+      radial-gradient(circle at 50% 0%, rgba(255, 255, 255, .07) 0%, rgba(255, 255, 255, 0) 45%),
+      radial-gradient(circle at 50% 125%, rgba(0, 0, 0, .55) 0%, rgba(0, 0, 0, 0) 60%);
+    color: var(--text);
+    font-family: var(--font-ui);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* ---------- Window shell ---------- */
+  .window {
+    display: grid;
+    grid-template-rows: auto 1fr auto;
+    width: min(1120px, 100%);
+    height: min(760px, 100%);
+    overflow: hidden;
+    border: 1px solid var(--panel-edge);
+    border-radius: 10px;
+    background: var(--panel);
+    box-shadow: 0 24px 70px rgba(0, 0, 0, .6), 0 2px 0 rgba(255, 255, 255, .04) inset;
+  }
+
+  .titlebar {
+    display: grid;
+    grid-template-columns: 1fr auto 1fr;
+    align-items: center;
+    gap: 12px;
+    padding: 0 14px;
+    height: 42px;
+    background: linear-gradient(#2a2a2e, var(--header));
+    border-bottom: 1px solid var(--header-edge);
+    user-select: none;
+  }
+
+  .controls {
+    display: flex;
+    gap: 8px;
+    justify-self: start;
+  }
+
+  .dot {
+    width: 13px;
+    height: 13px;
+    padding: 0;
+    border: 0;
+    border-radius: 50%;
+    box-shadow: inset 0 0 0 1px rgba(0, 0, 0, .28);
+    cursor: default;
+  }
+
+  .dot--close { background: var(--close); }
+  .dot--minimize { background: var(--minimize); }
+  .dot--maximize { background: var(--maximize); }
+  .dot:hover { filter: brightness(1.15); }
+
+  .titlebar__title {
+    grid-column: 2;
+    margin: 0;
+    font-family: var(--font-mono);
+    font-size: 13px;
+    font-weight: 500;
+    color: #d8d4d6;
+    white-space: nowrap;
+  }
+
+  .titlebar__meta {
+    grid-column: 3;
+    justify-self: end;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 11px;
+    color: var(--muted);
+  }
+
+  .status {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 9px;
+    border: 1px solid #3a3a40;
+    border-radius: 999px;
+    background: #26262a;
+    font-family: var(--font-mono);
+    white-space: nowrap;
+  }
+
+  .status::before {
+    content: "";
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--gray);
+  }
+
+  .status[data-state="ready"]::before { background: var(--green); }
+  .status[data-state="busy"]::before { background: var(--yellow); animation: pulse 1s ease-in-out infinite; }
+  .status[data-state="error"]::before { background: var(--red); }
+
+  @keyframes pulse { 50% { opacity: .25; } }
+
+  /* ---------- Terminal viewport ---------- */
+  .screen {
+    position: relative;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding: var(--pad-y) var(--pad-x) calc(var(--pad-y) + 8px);
+    background: var(--panel);
+    font-family: var(--font-mono);
+    font-size: 15px;
+    line-height: 1.5;
+    cursor: text;
+    scrollbar-color: #6b3b5b transparent;
+    scrollbar-width: thin;
+  }
+
+  .screen::-webkit-scrollbar { width: 11px; }
+  .screen::-webkit-scrollbar-track { background: transparent; }
+  .screen::-webkit-scrollbar-thumb {
+    background: #5b2f4b;
+    border: 3px solid var(--panel);
+    border-radius: 999px;
+  }
+  .screen::-webkit-scrollbar-thumb:hover { background: #7a4162; }
+
+  .output { margin: 0; }
+
+  .line {
+    margin: 0;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    color: var(--text);
+  }
+
+  /* Unix token colours */
+  .user { color: var(--green); font-weight: 700; }
+  .host { color: var(--green); font-weight: 700; }
+  .path { color: var(--blue); font-weight: 700; }
+  .prompt-sym { color: var(--white); font-weight: 700; }
+
+  .t-dir { color: var(--blue); font-weight: 700; }
+  .t-exec { color: var(--green); font-weight: 700; }
+  .t-link { color: var(--cyan); }
+  .t-err { color: var(--red); }
+  .t-warn { color: var(--yellow); }
+  .t-ok { color: var(--green); }
+  .t-info { color: var(--magenta); }
+  .t-dim { color: var(--gray); }
+
+  .block {
+    margin: 4px 0;
+    padding: 6px 10px;
+    border-left: 3px solid var(--panel-edge);
+    background: rgba(255, 255, 255, .035);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    color: #ded8dc;
+  }
+
+  .block--ai { border-left-color: var(--blue); }
+  .block--error { border-left-color: var(--red); color: #ffb3a7; }
+  .block--ok { border-left-color: var(--green); }
+
+  /* The block cursor is a layout spacer that only shows on an empty prompt.
+     Once you type, the native caret takes over at the true text position. */
+  .cursor {
+    flex: none;
+    width: 8px;
+    height: 1.05em;
+    margin-right: 1px;
+    vertical-align: text-bottom;
+    background: var(--text);
+    visibility: hidden;
+    animation: blink 1.05s steps(1, end) infinite;
+  }
+
+  @keyframes blink { 50% { opacity: 0; } }
+
+  /* ---------- Input row ---------- */
+  .prompt-row {
+    display: flex;
+    align-items: baseline;
+    gap: 0;
+    min-width: 0;
+  }
+
+  .prompt-row > .ps1 { flex: none; }
+
+  .prompt-input {
+    flex: 1 1 auto;
+    min-width: 0;
+    padding: 0;
+    border: 0;
+    outline: 0;
+    background: transparent;
+    color: var(--text);
+    font-family: inherit;
+    font-size: inherit;
+    line-height: inherit;
+    caret-color: var(--text);
+  }
+
+  .prompt-input::selection { background: #5c3566; color: var(--white); }
+
+  .prompt-row.is-empty .cursor { visibility: visible; }
+  .prompt-row.is-empty .prompt-input { caret-color: transparent; }
+  .prompt-row.is-busy .prompt-input { opacity: .45; }
+
+  /* ---------- Hint bar ---------- */
+  .hintbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 10px;
+    padding: 7px 14px;
+    border-top: 1px solid var(--header-edge);
+    background: #241019;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--muted);
+  }
+
+  .hintbar kbd {
+    padding: 1px 5px;
+    border: 1px solid #4a3a44;
+    border-radius: 4px;
+    background: #1b0d14;
+    color: #c9bfc5;
+    font-family: inherit;
+    font-size: 11px;
+  }
+
+  .hintbar__sep { color: #4a3a44; }
+
+  .hint {
+    padding: 1px 7px;
+    border: 1px dashed #5b2f4b;
+    border-radius: 999px;
+    color: #c8a8bd;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+
+  .hint:hover { border-style: solid; color: var(--white); }
+
+  @media (max-width: 720px) {
+    .titlebar { grid-template-columns: auto 1fr; }
+    .titlebar__meta { display: none; }
+    .titlebar__title { justify-self: center; }
+    .screen { font-size: 13.5px; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .cursor, .status[data-state="busy"]::before { animation: none; }
+  }
+</style>
+</head>
+
+<body>
+<main class="window" aria-label="Ubuntu terminal simulator">
+  <header class="titlebar">
+    <div class="controls" aria-hidden="true">
+      <button class="dot dot--close" tabindex="-1" type="button"></button>
+      <button class="dot dot--minimize" tabindex="-1" type="button"></button>
+      <button class="dot dot--maximize" tabindex="-1" type="button"></button>
+    </div>
+    <h1 class="titlebar__title">ubuntu@sandbox-vm: ~</h1>
+    <div class="titlebar__meta">
+      <span class="status" id="status" data-state="boot" role="status" aria-live="polite">booting</span>
+      <span>Ubuntu 26.04 LTS</span>
+    </div>
+  </header>
+
+  <section class="screen" id="screen" tabindex="-1" aria-label="Terminal output">
+    <div class="output" id="output" role="log" aria-live="polite" aria-relevant="additions text"></div>
+  </section>
+
+  <footer class="hintbar">
+    <span>try:</span>
+    <span class="hint" data-cmd="ls -la">ls -la</span>
+    <span class="hint" data-cmd="mkdir projects">mkdir projects</span>
+    <span class="hint" data-cmd="create a folder called invoices">create a folder called invoices</span>
+    <span class="hint" data-cmd="remove everything inside Documents">remove everything inside Documents</span>
+    <span class="hint" data-cmd="help">help</span>
+    <span class="hintbar__sep">|</span>
+    <span><kbd>Enter</kbd> run</span>
+    <span class="hintbar__sep">|</span>
+    <span><kbd>&uarr;</kbd><kbd>&darr;</kbd> history</span>
+  </footer>
+</main>
+
+<script type="module">
+/* =====================================================================
+   Ubuntu 26.04 LTS Terminal Simulator
+   Single-file build. No build step, no server, no API keys.
+
+   Two engines route every keystroke-level command:
+     Route A  native Bash   - parsed and applied to an in-memory VFS.
+     Route B  Kernel AI     - plain English, compiled by WebLLM to JSON.
+   ===================================================================== */
+
+const WEBLLM_CDN = 'https://esm.run/@mlc-ai/web-llm';
+const MODEL_ID = 'Llama-3.2-1B-Instruct-q4f16_1-MLC';
+const MAX_HISTORY = 100;
+const MAX_RENDERED_LINES = 2500;
+
+const cfg = {
+  user: 'ubuntu',
+  host: 'sandbox-vm',
+  root: '~',
+  aiEnabled: true
+};
+
+/* ---------------------------------------------------------------------
+   1. Virtual File System
+   ------------------------------------------------------------------ */
+const DIR_MIME = 'inode/directory';
+
+function makeDir(name, children = {}) {
+  return { name, type: 'dir', children };
+}
+
+function makeFile(name, content = '', extra = {}) {
+  return { name, type: 'file', content, ...extra };
+}
+
+const VFS = makeDir(cfg.root, {
+  Documents: makeDir('Documents', {
+    'notes.txt': makeFile('notes.txt', 'Remember: the AI engine runs locally, so nothing leaves this browser tab.\n')
+  }),
+  Downloads: makeDir('Downloads', {}),
+  Desktop: makeDir('Desktop', {
+    'shortcuts.txt': makeFile('shortcuts.txt', 'Route A: native Bash utilities.\nRoute B: plain English, compiled by the local model.\n')
+  }),
+  'welcome.txt': makeFile(
+    'welcome.txt',
+    [
+      'Welcome to Ubuntu 26.04 LTS (sandbox-vm)',
+      '',
+      'This terminal has two engines behind one prompt.',
+      '  Route A  native Bash utilities run instantly against a local file system.',
+      '  Route B  plain English is compiled by a local language model into a command.',
+      '',
+      'Try:  ls -la',
+      '      mkdir projects',
+      '      create a folder called invoices',
+      '',
+      'Nothing is uploaded. Every byte stays in this tab.',
+      ''
+    ].join('\n')
+  )
+});
+
+/* Pristine copy of the factory image, used by the `reset` command. */
+const FACTORY_IMAGE = cloneVfs();
+
+/* ---------------------------------------------------------------------
+   2. Path helpers
+   ------------------------------------------------------------------ */
+function isDir(node) {
+  return Boolean(node) && node.type === 'dir';
+}
+
+/** Resolve '.' and '..' in a raw segment list. */
+function normalizeSegments(rawSegments) {
+  const segments = [];
+  for (const raw of rawSegments) {
+    if (raw === '' || raw === '.') continue;
+    if (raw === '..') { segments.pop(); continue; }
+    segments.push(raw);
+  }
+  return segments;
+}
+
+/** Turn a user-supplied path (absolute, ~, or relative) into absolute tokens. */
+function resolveTokens(input, cwdTokens = []) {
+  const value = String(input ?? '').trim();
+  if (value === '' || value === '.' || value === './') return [...cwdTokens];
+  if (value === cfg.root || value === cfg.root + '/') return [];
+  if (value.startsWith(cfg.root + '/')) return normalizeSegments(value.slice(cfg.root.length).split('/'));
+  if (value.startsWith('/')) return normalizeSegments(value.split('/'));
+  return normalizeSegments([...cwdTokens, ...value.split('/')]);
+}
+
+function getNode(tokens) {
+  let node = VFS;
+  for (const token of tokens) {
+    if (!isDir(node)) return null;
+    const next = node.children[token];
+    if (!next) return null;
+    node = next;
+  }
+  return node;
+}
+
+/** Find a node. Returns { node, tokens } or null. */
+function lookup(path, cwdTokens) {
+  const tokens = resolveTokens(path, cwdTokens);
+  const node = getNode(tokens);
+  return node ? { node, tokens } : null;
+}
+
+function parentOf(path, cwdTokens) {
+  const tokens = resolveTokens(path, cwdTokens);
+  const name = tokens[tokens.length - 1] ?? '';
+  const parentTokens = tokens.slice(0, -1);
+  const parent = getNode(parentTokens);
+  return isDir(parent) ? { parent, parentTokens, name, tokens } : null;
+}
+
+function childNames(dir) {
+  return Object.keys(dir.children).sort((a, b) => a.localeCompare(b));
+}
+
+function displayPath(tokens) {
+  return tokens.length === 0 ? cfg.root : cfg.root + '/' + tokens.join('/');
+}
+
+function makeUniqueName(parent, base) {
+  if (!parent.children[base]) return base;
+  let counter = 1;
+  let candidate = `${base}.${counter}`;
+  while (parent.children[candidate]) candidate = `${base}.${++counter}`;
+  return candidate;
+}
+
+function cloneVfs(node = VFS) {
+  if (node.type === 'file') {
+    const { name, type, content, mode } = node;
+    return mode ? { name, type, content, mode } : { name, type, content };
+  }
+  const children = {};
+  for (const key of Object.keys(node.children)) children[key] = cloneVfs(node.children[key]);
+  return { name: node.name, type: 'dir', children };
+}
+
+function countEntries(node) {
+  return node.type === 'dir' ? Object.keys(node.children).length : 0;
+}
+
+/* ---------------------------------------------------------------------
+   3. Terminal view
+   ------------------------------------------------------------------ */
+const screenEl = document.getElementById('screen');
+const outputEl = document.getElementById('output');
+const statusEl = document.getElementById('status');
+const hintbarEl = document.querySelector('.hintbar');
+
+const state = {
+  cwd: [],
+  history: [],
+  historyIndex: 0,
+  draft: '',
+  busy: false,
+  renderedLines: 0
+};
+
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"]/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch]));
+}
+
+/** Output always goes above the live prompt row, never below it. */
+function insertOutput(node) {
+  if (promptRow && promptRow.parentNode === outputEl) outputEl.insertBefore(node, promptRow);
+  else outputEl.appendChild(node);
+}
+
+function trimLines() {
+  while (outputEl.childElementCount > MAX_RENDERED_LINES && outputEl.firstElementChild !== promptRow) {
+    outputEl.firstElementChild.remove();
+  }
+}
+
+function writeLine(html = '', className = '') {
+  const line = document.createElement('p');
+  line.className = className ? `line ${className}` : 'line';
+  line.innerHTML = html;
+  insertOutput(line);
+  state.renderedLines += 1;
+  trimLines();
+  return line;
+}
+
+function writeText(text, className = '') {
+  const lines = String(text).replace(/\n+$/, '').split('\n');
+  for (const line of lines) writeLine(escapeHtml(line), className);
+}
+
+function writeBlock(text, variant = '') {
+  const block = document.createElement('div');
+  block.className = variant ? `block ${variant}` : 'block';
+  block.textContent = text;
+  insertOutput(block);
+  state.renderedLines += 1;
+  trimLines();
+  return block;
+}
+
+/** Build the coloured `ubuntu@sandbox-vm:~$` prompt token. */
+function promptHtml() {
+  return `<span class="user">${escapeHtml(cfg.user)}</span>@<span class="host">${escapeHtml(cfg.host)}</span>:<span class="path">${escapeHtml(displayPath(state.cwd))}</span><span class="prompt-sym">$</span>`;
+}
+
+function scrollToBottom() {
+  screenEl.scrollTop = screenEl.scrollHeight;
+}
+
+/* ---------------------------------------------------------------------
+   4. Prompt input
+   ------------------------------------------------------------------ */
+let promptRow = null;
+let inputEl = null;
+
+function buildPromptRow() {
+  const row = document.createElement('div');
+  row.className = 'prompt-row';
+
+  const ps1 = document.createElement('span');
+  ps1.className = 'ps1';
+  ps1.setAttribute('aria-hidden', 'true');
+
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.className = 'prompt-input';
+  input.id = 'prompt';
+  input.autocomplete = 'off';
+  input.autocapitalize = 'off';
+  input.spellcheck = false;
+  input.setAttribute('autocorrect', 'off');
+  input.setAttribute('aria-label', 'Terminal command input');
+  input.setAttribute('enterkeyhint', 'go');
+
+  const cursor = document.createElement('span');
+  cursor.className = 'cursor';
+  cursor.setAttribute('aria-hidden', 'true');
+
+  row.append(ps1, input, cursor);
+  outputEl.appendChild(row);
+  trimLines();
+
+  row.addEventListener('mousedown', (event) => {
+    if (event.target === input) return;
+    event.preventDefault();
+    input.focus();
+  });
+
+  input.addEventListener('input', () => {
+    state.draft = input.value;
+    syncCursorState();
+  });
+
+  input.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      submit(input.value);
+      return;
+    }
+    if (event.key === 'ArrowUp') { event.preventDefault(); recall(-1); return; }
+    if (event.key === 'ArrowDown') { event.preventDefault(); recall(1); return; }
+    if (event.key === 'l' && event.ctrlKey) { event.preventDefault(); clearScreen(); return; }
+    if (event.key === 'c' && event.ctrlKey) {
+      event.preventDefault();
+      const pending = input.value;
+      input.value = '';
+      state.draft = '';
+      writeLine(`${promptHtml()} ${escapeHtml(pending)}`);
+      if (pending.trim() === '') writeLine('');
+      setPrompt();
+      return;
+    }
+    if (event.key === 'u' && event.ctrlKey) { event.preventDefault(); input.value = ''; state.draft = ''; return; }
+  });
+
+  return { row, input, cursor };
+}
+
+function setPrompt() {
+  promptRow.querySelector('.ps1').innerHTML = promptHtml();
+  promptRow.classList.remove('is-busy');
+  inputEl.disabled = false;
+  syncCursorState();
+}
+
+function setBusyPrompt() {
+  promptRow.querySelector('.ps1').innerHTML = promptHtml();
+  promptRow.classList.add('is-busy');
+  inputEl.disabled = true;
+}
+
+/** Show the block cursor only while the prompt line is empty. */
+function syncCursorState() {
+  promptRow.classList.toggle('is-empty', inputEl.value.length === 0);
+}
+
+function focusInput() {
+  if (!inputEl) return;
+  requestAnimationFrame(() => {
+    if (document.hidden) return;
+    if (inputEl.disabled) return;
+    if (document.activeElement === inputEl) return;
+    inputEl.focus({ preventScroll: true });
+  });
+}
+
+function recall(direction) {
+  if (state.history.length === 0) return;
+  if (direction < 0 && state.historyIndex === state.history.length) state.draft = inputEl.value;
+  state.historyIndex = Math.max(0, Math.min(state.history.length, state.historyIndex + direction));
+  inputEl.value = state.historyIndex >= state.history.length ? state.draft : state.history[state.historyIndex];
+  inputEl.setSelectionRange(inputEl.value.length, inputEl.value.length);
+  syncCursorState();
+}
+
+function pushHistory(command) {
+  if (!command || state.history[state.history.length - 1] !== command) state.history.push(command);
+  if (state.history.length > MAX_HISTORY) state.history.shift();
+  state.historyIndex = state.history.length;
+  state.draft = '';
+}
+
+function clearScreen() {
+  outputEl.replaceChildren();
+  state.renderedLines = 0;
+  if (promptRow) outputEl.appendChild(promptRow);
+  setPrompt();
+  scrollToBottom();
+}
+
+function rebuildPrompt() {
+  const { row, input } = buildPromptRow();
+  promptRow = row;
+  inputEl = input;
+  setPrompt();
+  scrollToBottom();
+  focusInput();
+}
+
+function setStatus(label, stateName) {
+  statusEl.textContent = label;
+  statusEl.dataset.state = stateName;
+}
+
+/* ---------------------------------------------------------------------
+   5. Command catalog
+   ------------------------------------------------------------------ */
+const NATIVE_COMMANDS = ['ls', 'mkdir', 'touch', 'rm', 'rmdir', 'cd', 'pwd', 'cat', 'echo', 'clear', 'help', 'date', 'whoami'];
+
+const USAGE = {
+  ls: 'ls [-a] [-l] [path]',
+  mkdir: 'mkdir <name> [name...]',
+  touch: 'touch <file> [file...]',
+  rm: 'rm [-r] <path> [path...]',
+  rmdir: 'rmdir <dir> [dir...]',
+  cd: 'cd [path]',
+  pwd: 'pwd',
+  cat: 'cat <file> [file...]',
+  echo: 'echo <text>',
+  clear: 'clear',
+  help: 'help [command]',
+  date: 'date',
+  whoami: 'whoami'
+};
+
+const DESCRIPTIONS = {
+  ls: 'list directory contents',
+  mkdir: 'create directories',
+  touch: 'create empty files or update timestamps',
+  rm: 'remove files and directories',
+  rmdir: 'remove empty directories',
+  cd: 'change the working directory',
+  pwd: 'print the working directory',
+  cat: 'print file contents',
+  echo: 'print text, supports > and >> redirection',
+  clear: 'clear the screen',
+  help: 'list the supported commands',
+  date: 'print the current date and time',
+  whoami: 'print the current user'
+};
+
+function tokenize(command) {
+  const tokens = [];
+  const pattern = /"([^"]*)"|'([^']*)'|(\S+)/g;
+  let match;
+  while ((match = pattern.exec(command)) !== null) {
+    tokens.push(match[1] ?? match[2] ?? match[3]);
+  }
+  return tokens;
+}
+
+/* ---------------------------------------------------------------------
+   6. Route A - native Bash engine
+   ------------------------------------------------------------------ */
+class ShellError extends Error {}
+
+function listDirectory(args) {
+  const entries = args.filter((a) => !a.startsWith('-') && a !== '--');
+  const flags = args.filter((a) => a.startsWith('-') && a !== '--').join('');
+  const showAll = flags.includes('a');
+  const long = flags.includes('l');
+
+  if (entries.length > 1) throw new ShellError(`ls: extra operand '${entries[1]}'`);
+
+  const target = entries[0] ?? '.';
+  const found = lookup(target, state.cwd);
+  if (!found) throw new ShellError(`ls: cannot access '${target}': No such file or directory`);
+
+  if (!isDir(found.node)) {
+    if (long) {
+      writeLine(`-rw-r--r-- 1 ${cfg.user} ${cfg.user} ${String(found.node.content.length).padStart(6)} ${escapeHtml(found.node.name)}`);
+    } else {
+      writeLine(escapeHtml(found.node.name));
+    }
+    return;
+  }
+
+  if (long) writeLine(`total ${countEntries(found.node)}`);
+  const names = childNames(found.node);
+  const visible = showAll ? ['.', '..', ...names] : names;
+  if (visible.length === 0) return;
+
+  if (long) {
+    for (const name of visible) {
+      const node = name === '.' ? found.node : name === '..' ? found.node : found.node.children[name];
+      const isFolder = isDir(node);
+      const mode = isFolder ? 'drwxr-xr-x' : '-rw-r--r--';
+      const size = isFolder ? 4096 : (node?.content?.length ?? 0);
+      const cls = isFolder ? 't-dir' : 'line';
+      writeLine(
+        `${mode} 1 ${cfg.user} ${cfg.user} ${String(size).padStart(6)} ${escapeHtml(name)}`,
+        cls
+      );
+    }
+    return;
+  }
+
+  writeLine(visible.map((name) => {
+    const node = found.node.children[name];
+    const isFolder = isDir(node);
+    return `<span class="${isFolder ? 't-dir' : ''}">${escapeHtml(name)}${isFolder ? '/' : ''}</span>`;
+  }).join('  '));
+}
+
+function makeDirectory(args) {
+  if (args.length === 0) throw new ShellError('mkdir: missing operand');
+  const names = args.filter((a) => !a.startsWith('-'));
+  if (names.length === 0) throw new ShellError('mkdir: missing operand');
+  for (const name of names) {
+    const target = parentOf(name, state.cwd);
+    if (!target) throw new ShellError(`mkdir: cannot create directory '${name}': No such file or directory`);
+    if (target.parent.children[target.name]) {
+      throw new ShellError(`mkdir: cannot create directory '${name}': File exists`);
+    }
+    target.parent.children[target.name] = makeDir(target.name);
+  }
+}
+
+function touchFiles(args) {
+  if (args.length === 0) throw new ShellError('touch: missing file operand');
+  for (const name of args.filter((a) => !a.startsWith('-'))) {
+    const target = parentOf(name, state.cwd);
+    if (!target) throw new ShellError(`touch: cannot touch '${name}': No such file or directory`);
+    if (!target.parent.children[target.name]) {
+      target.parent.children[target.name] = makeFile(target.name, '');
+    }
+  }
+}
+
+function removeEntries(args) {
+  const recursive = args.some((a) => a.startsWith('-') && a.includes('r'));
+  const names = args.filter((a) => !a.startsWith('-'));
+  if (names.length === 0) throw new ShellError('rm: missing operand');
+
+  for (const name of names) {
+    const found = lookup(name, state.cwd);
+    if (!found) throw new ShellError(`rm: cannot remove '${name}': No such file or directory`);
+    if (found.tokens.length === 0) throw new ShellError('rm: refusing to remove the root directory');
+    if (isDir(found.node) && !recursive) {
+      throw new ShellError(`rm: cannot remove '${name}': Is a directory`);
+    }
+    const parent = getNode(found.tokens.slice(0, -1));
+    delete parent.children[found.node.name];
+    if (found.tokens.length <= state.cwd.length) state.cwd = [];
+  }
+}
+
+function removeEmptyDirectories(args) {
+  if (args.length === 0) throw new ShellError('rmdir: missing operand');
+  for (const name of args.filter((a) => !a.startsWith('-'))) {
+    const found = lookup(name, state.cwd);
+    if (!found) throw new ShellError(`rmdir: failed to remove '${name}': No such file or directory`);
+    if (!isDir(found.node)) throw new ShellError(`rmdir: failed to remove '${name}': Not a directory`);
+    if (countEntries(found.node) > 0) throw new ShellError(`rmdir: failed to remove '${name}': Directory not empty`);
+    const parent = getNode(found.tokens.slice(0, -1));
+    delete parent.children[found.node.name];
+  }
+}
+
+function changeDirectory(args) {
+  const target = args[0] ?? cfg.root;
+  const found = lookup(target, state.cwd);
+  if (!found) throw new ShellError(`bash: cd: ${target}: No such file or directory`);
+  if (!isDir(found.node)) throw new ShellError(`bash: cd: ${target}: Not a directory`);
+  state.cwd = found.tokens;
+}
+
+function printFile(args) {
+  if (args.length === 0) throw new ShellError('cat: missing operand');
+  for (const name of args.filter((a) => !a.startsWith('-'))) {
+    const found = lookup(name, state.cwd);
+    if (!found) throw new ShellError(`cat: ${name}: No such file or directory`);
+    if (isDir(found.node)) throw new ShellError(`cat: ${name}: Is a directory`);
+    writeText(found.node.content);
+  }
+}
+
+function echoText(args) {
+  const redirectAt = args.findIndex((a) => a === '>' || a === '>>');
+  if (redirectAt === -1) {
+    writeText(args.join(' '));
+    return;
+  }
+  const text = args.slice(0, redirectAt).join(' ');
+  const targetName = args[redirectAt + 1];
+  if (!targetName) throw new ShellError('bash: syntax error near unexpected token `newline\'');
+  const target = parentOf(targetName, state.cwd);
+  if (!target) throw new ShellError(`bash: ${targetName}: No such file or directory`);
+  const append = args[redirectAt] === '>>';
+  const existing = target.parent.children[target.name];
+  const previous = append && existing ? existing.content : '';
+  target.parent.children[target.name] = makeFile(target.name, `${previous}${text}\n`);
+}
+
+function printHelp(args) {
+  const topic = args[0];
+  if (topic) {
+    const command = topic.toLowerCase();
+    if (!USAGE[command]) throw new ShellError(`help: no help topics match '${topic}'`);
+    writeLine(`<span class="t-ok">${escapeHtml(command)}</span> - ${escapeHtml(DESCRIPTIONS[command])}`);
+    writeLine(`usage: ${escapeHtml(USAGE[command])}`);
+    return;
+  }
+  writeLine('<span class="t-ok">Native Bash commands</span> (Route A, instant):');
+  for (const command of NATIVE_COMMANDS) {
+    writeLine(`  <span class="t-dir">${escapeHtml(command.padEnd(8))}</span>${escapeHtml(DESCRIPTIONS[command])}`);
+  }
+  writeLine('');
+  writeLine('<span class="t-info">Plain English</span> (Route B, compiled by the local model):');
+  writeLine('  Any other input is read as intent. Example: <span class="t-dim">create a folder called invoices</span>');
+  writeLine('  The model returns JSON such as <span class="t-dim">{"bash":"mkdir","argument":"invoices"}</span>');
+}
+
+/** Route A entry point. Parses a raw command line and runs it. Returns true when handled. */
+function runNative(input) {
+  const tokens = tokenize(input);
+  const command = (tokens.shift() ?? '').toLowerCase();
+  if (!isNativeKeyword(command)) return false;
+  return executeNative(command, tokens);
+}
+
+/** Execute one native command against the VFS. Throws ShellError on failure. */
+function executeNative(command, args) {
+  switch (command) {
+    case 'ls': listDirectory(args); break;
+    case 'mkdir': makeDirectory(args); break;
+    case 'touch': touchFiles(args); break;
+    case 'rm': removeEntries(args); break;
+    case 'rmdir': removeEmptyDirectories(args); break;
+    case 'cd': changeDirectory(args); break;
+    case 'pwd': writeLine(escapeHtml(`/home/${cfg.user}${state.cwd.length ? '/' + state.cwd.join('/') : ''}`)); break;
+    case 'cat': printFile(args); break;
+    case 'echo': echoText(args); break;
+    case 'help': printHelp(args); break;
+    case 'date': writeLine(escapeHtml(new Date().toString())); break;
+    case 'whoami': writeLine(escapeHtml(cfg.user)); break;
+    case 'clear': clearScreen(); break;
+    default: return false;
+  }
+  return true;
+}
+
+/* ---------------------------------------------------------------------
+   7. Route B - Kernel AI engine (WebLLM)
+   ------------------------------------------------------------------ */
+const SYSTEM_PROMPT = `You are the Kernel AI inside an Ubuntu terminal simulator.
+You translate one plain English request into one native terminal command.
+You must answer with a single minified JSON object and nothing else.
+No markdown, no code fences, no backticks, no commentary, no newlines.
+
+Allowed keys:
+{"bash": string, "argument": string, "arguments": string[], "reply": string}
+
+Rules:
+1. "bash" must be one of: ls, mkdir, touch, rm, rmdir, cd, pwd, cat, echo, clear.
+2. Put a single target in "argument", or several targets in "arguments".
+3. Use rm with "recursive": true to delete a directory and its contents.
+4. Put a short spoken confirmation in "reply" only when no command applies.
+5. Never invent a path that is not listed in the file system state.
+6. Output JSON only.`;
+
+const MODELS = [
+  { id: MODEL_ID, label: 'Llama-3.2-1B-Instruct-q4f16_1-MLC', size: '~900 MB', note: 'default' },
+  { id: 'Llama-3.2-1B-Instruct-q4f32_1-MLC', label: 'Llama-3.2-1B-Instruct-q4f32_1-MLC', size: '~1.1 GB', note: 'higher precision' },
+  { id: 'Qwen2.5-0.5B-Instruct-q4f16_1-MLC', label: 'Qwen2.5-0.5B-Instruct-q4f16_1-MLC', size: '~500 MB', note: 'smallest download' }
+];
+
+const engineState = {
+  library: null,
+  engine: null,
+  status: 'idle',
+  model: MODEL_ID,
+  progress: -1,
+  downloadMs: 0,
+  lastLatency: null,
+  failures: 0
+};
+
+let enginePromise = null;
+
+function setAiStatus(statusName) {
+  engineState.status = statusName;
+  if (statusName === 'checking') setStatus('checking gpu', 'busy');
+  else if (statusName === 'idle') setStatus('kernel ai idle', 'ready');
+  else if (statusName === 'ready') setStatus('kernel ai ready', 'ready');
+  else if (statusName === 'loading') setStatus('loading model', 'busy');
+  else if (statusName === 'generating') setStatus('thinking', 'busy');
+  else if (statusName === 'unavailable') setStatus('kernel ai off', 'error');
+  else if (statusName === 'error') setStatus('kernel ai error', 'error');
+}
+
+/** Stream WebLLM loading progress straight into the terminal output. */
+function initProgressCallback(report) {
+  if (!report || typeof report !== 'object') return;
+
+  if (report.text === undefined && report.progress === undefined) {
+    // Shader compilation stage: report.text is undefined during this pass.
+    if (!engineState._shaderLogged) {
+      engineState._shaderLogged = true;
+      writeLine('<span class="t-dim">[Kernel AI] compiling WebGPU shaders...</span>');
+    }
+    return;
+  }
+
+  const progress = typeof report.progress === 'number' ? report.progress : 0;
+  const percent = Math.max(0, Math.min(100, Math.round(progress * 100)));
+  engineState.progress = percent;
+
+  // One line per stage, throttled to whole 5% steps so the log stays readable.
+  const stage = `${percent}:${report.text ?? ''}`;
+  if (stage === engineState._lastStage) return;
+  if (engineState._lastPercent === percent && engineState._lastText === (report.text ?? '')) return;
+  engineState._lastStage = stage;
+  engineState._lastPercent = percent;
+  engineState._lastText = report.text ?? '';
+
+  const bar = `[${'#'.repeat(Math.round(percent / 5)).padEnd(20, '-')}]`;
+  writeLine(`<span class="t-dim">[Kernel AI] ${bar} ${String(percent).padStart(3)}% ${escapeHtml(report.text ?? 'initialising')}</span>`);
+  scrollToBottom();
+}
+
+function humanizeLoadError(error) {
+  const message = String(error?.message ?? error ?? '');
+  if (/webgpu|gpu adapter|navigator\.gpu/i.test(message)) return 'WebGPU is unavailable in this browser.';
+  if (/fetch|network|Failed to load|CORS/i.test(message)) return 'The model files could not be downloaded.';
+  if (/storage|quota|OPFS/i.test(message)) return 'Browser storage is full or blocked.';
+  if (/model|not found|404/i.test(message)) return 'The model could not be found on the CDN.';
+  return message || 'Unknown engine failure.';
+}
+
+async function getEngine() {
+  if (engineState.engine) return engineState.engine;
+  if (enginePromise) return enginePromise;
+
+  enginePromise = (async () => {
+    const started = performance.now();
+    setAiStatus('loading');
+
+    writeLine('<span class="t-dim">[Kernel AI] loading @mlc-ai/web-llm from esm.run...</span>');
+    const webllm = await import(/* @vite-ignore */ WEBLLM_CDN);
+    engineState.library = webllm;
+    writeLine(`<span class="t-ok">[Kernel AI] runtime ready (web-llm ${escapeHtml(webllm.version ?? 'unknown')})</span>`);
+
+    writeLine(`<span class="t-dim">[Kernel AI] compiling ${escapeHtml(engineState.model)} for WebGPU...</span>`);
+    const engine = await webllm.CreateMLCEngine(engineState.model, {
+      initProgressCallback,
+      logLevel: 'WARN'
+    });
+
+    engineState.engine = engine;
+    engineState.downloadMs = Math.round(performance.now() - started);
+    engineState.failures = 0;
+    setAiStatus('ready');
+    writeLine(`<span class="t-ok">[Kernel AI] model cached in ${(engineState.downloadMs / 1000).toFixed(1)}s. Plain English is live.</span>`);
+    return engine;
+  })().catch((error) => {
+    enginePromise = null;
+    engineState.failures += 1;
+    setAiStatus('error');
+    throw error;
+  });
+
+  return enginePromise;
+}
+
+function vfsSnapshot() {
+  const summarize = (node, depth = 0) => {
+    const pad = '  '.repeat(depth);
+    const lines = [`${pad}${node.name}/`];
+    for (const key of childNames(node)) {
+      const child = node.children[key];
+      if (child.type === 'dir') lines.push(...summarize(child, depth + 1));
+      else lines.push(`${pad}  ${child.name} (${child.content.length} bytes)`);
+    }
+    return lines;
+  };
+  return summarize(VFS).join('\n');
+}
+
+function groundingMessage(request) {
+  return [
+    'Current working directory: ' + displayPath(state.cwd),
+    'File system state:',
+    vfsSnapshot(),
+    '',
+    'User request: ' + request,
+    'JSON:'
+  ].join('\n');
+}
+
+/** Pull the first balanced JSON object out of a model response. */
+function extractJson(text) {
+  const cleaned = String(text ?? '')
+    .replace(/```[a-zA-Z]*\n?/g, '')
+    .replace(/```/g, '')
+    .trim();
+
+  const start = cleaned.indexOf('{');
+  if (start === -1) return null;
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let index = start; index < cleaned.length; index += 1) {
+    const char = cleaned[index];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === '"') { inString = true; continue; }
+    if (char === '{') depth += 1;
+    else if (char === '}') {
+      depth -= 1;
+      if (depth === 0) {
+        try { return JSON.parse(cleaned.slice(start, index + 1)); }
+        catch { return null; }
+      }
+    }
+  }
+  return null;
+}
+
+const ACTION_ALIASES = {
+  ls: 'ls', list: 'ls', dir: 'ls',
+  mkdir: 'mkdir', 'make-dir': 'mkdir', 'make-directory': 'mkdir', createfolder: 'mkdir', 'create-folder': 'mkdir',
+  touch: 'touch', 'create-file': 'touch', createfile: 'touch',
+  rm: 'rm', remove: 'rm', delete: 'rm', erase: 'rm', del: 'rm',
+  rmdir: 'rmdir', 'remove-dir': 'rmdir',
+  cd: 'cd', 'change-dir': 'cd',
+  pwd: 'pwd', cwd: 'pwd',
+  cat: 'cat', read: 'cat', show: 'cat', print: 'cat',
+  echo: 'echo',
+  clear: 'clear', cls: 'clear'
+};
+
+/* Spoken words a person may type instead of the utility name. */
+const VERB_ALIASES = {
+  clean: 'clear',
+  cls: 'clear',
+  wipe: 'clear',
+  dir: 'ls',
+  delete: 'rm',
+  remove: 'rm',
+  erase: 'rm'
+};
+
+function isNativeKeyword(word) {
+  const value = String(word).toLowerCase();
+  return NATIVE_COMMANDS.includes(value) || value in VERB_ALIASES;
+}
+
+function normalizeArguments(action, parsed) {
+  const candidates = [];
+  if (typeof parsed.argument === 'string') candidates.push(parsed.argument);
+  if (typeof parsed.target === 'string') candidates.push(parsed.target);
+  if (typeof parsed.path === 'string') candidates.push(parsed.path);
+  if (typeof parsed.name === 'string') candidates.push(parsed.name);
+  if (Array.isArray(parsed.arguments)) candidates.push(...parsed.arguments);
+  if (Array.isArray(parsed.targets)) candidates.push(...parsed.targets);
+  if (Array.isArray(parsed.paths)) candidates.push(...parsed.paths);
+
+  const args = candidates.map((item) => String(item).trim()).filter(Boolean);
+  if (action === 'ls' && args.length === 0) args.push('.');
+  if (parsed.recursive === true && action === 'rm') args.unshift('-r');
+  return args;
+}
+
+/** Turn a validated model object into argv tokens for the native engine. */
+function buildArgv(action, parsed) {
+  const args = normalizeArguments(action, parsed);
+  if (action === 'rm' && args.length === 0) throw new ShellError('rm: missing operand');
+  if (action === 'rmdir' && args.length === 0) throw new ShellError('rmdir: missing operand');
+  if (action === 'touch' && args.length === 0) throw new ShellError('touch: missing file operand');
+  if (action === 'mkdir' && args.length === 0) throw new ShellError('mkdir: missing operand');
+  if (action === 'cat' && args.length === 0) throw new ShellError('cat: missing operand');
+  return [action, ...args];
+}
+
+/** Route B entry point. Falls back to a friendly message when the AI is off. */
+async function runNaturalLanguage(request) {
+  if (!cfg.aiEnabled) {
+    writeBlock(
+      'Kernel AI is disabled. Enable it with:  ai on\nNative Bash still works: ' + NATIVE_COMMANDS.join(', '),
+      'block--error'
+    );
+    return;
+  }
+
+  writeLine('<span class="t-info">&#129302; [Kernel AI]: Compiling natural language intent...</span>');
+
+  let parsed;
+  try {
+    const engine = await getEngine();
+    setAiStatus('generating');
+    const started = performance.now();
+    const completion = await engine.chat.completions.create({
+      messages: [
+        { role: 'system', content: SYSTEM_PROMPT },
+        { role: 'user', content: groundingMessage(request) }
+      ],
+      temperature: 0.0,
+      top_p: 1.0,
+      max_tokens: 200,
+      stream: false
+    });
+    engineState.lastLatency = Math.round(performance.now() - started);
+    setAiStatus('ready');
+    const raw = completion?.choices?.[0]?.message?.content ?? '';
+    parsed = extractJson(raw);
+    if (!parsed) {
+      writeLine('<span class="t-warn">[Kernel AI] the model did not return JSON. Raw output:</span>');
+      writeBlock(String(raw).trim() || '(empty response)', 'block--ai');
+      return;
+    }
+  } catch (error) {
+    writeBlock(`[Kernel AI] ${humanizeLoadError(error)}\nNative Bash commands are unaffected. Retry with:  ai load`, 'block--error');
+    setAiStatus('error');
+    return;
+  }
+
+  const rawAction = String(parsed.bash ?? parsed.command ?? parsed.action ?? '').toLowerCase().replace(/\s+/g, '-');
+  const action = ACTION_ALIASES[rawAction] ?? (NATIVE_COMMANDS.includes(rawAction) ? rawAction : null);
+  const reply = typeof parsed.reply === 'string' ? parsed.reply : '';
+
+  writeLine(`<span class="t-dim">[Kernel AI] intent decoded in ${engineState.lastLatency ?? '?'} ms &rarr; ${escapeHtml(JSON.stringify(parsed))}</span>`);
+
+  if (!action) {
+    writeLine('<span class="t-warn">[Kernel AI] no terminal command matched this request.</span>');
+    if (reply) writeBlock(reply, 'block--ai');
+    else writeBlock('Try naming a native command, for example: "list the Downloads folder".', 'block--ai');
+    return;
+  }
+
+  if (action === 'clear') { clearScreen(); return; }
+
+  let argv;
+  try {
+    argv = buildArgv(action, parsed);
+  } catch (error) {
+    writeBlock(`[Kernel AI] ${error.message}`, 'block--error');
+    return;
+  }
+
+  const command = argv.map((part) => (/\s/.test(part) ? JSON.stringify(part) : part)).join(' ');
+  writeLine(`${promptHtml()} ${escapeHtml(command)}`);
+  applyNative(argv, { echoPrompt: false });
+}
+
+/** Run argv through Route A without re-entering the router. */
+function applyNative(argv, { echoPrompt = true } = {}) {
+  const [command, ...args] = argv;
+  if (echoPrompt) writeLine(`${promptHtml()} ${escapeHtml(argv.join(' '))}`);
+  try {
+    if (!executeNative(command, args)) throw new ShellError(`${command}: command not found`);
+  } catch (error) {
+    const message = error instanceof ShellError ? error.message : `bash: ${command}: ${error?.message ?? error}`;
+    writeLine(escapeHtml(message), 't-err');
+  }
+}
+
+/* ---------------------------------------------------------------------
+   8. Simulator control commands (ai, model)
+   ------------------------------------------------------------------ */
+async function handleControlCommand(tokens) {
+  const command = tokens[0].toLowerCase();
+
+  if (command === 'ai') {
+    const action = (tokens[1] ?? 'status').toLowerCase();
+    if (action === 'status') {
+      const status = engineState.engine ? 'ready' : engineState.status;
+      writeLine(`Kernel AI: <span class="t-ok">${escapeHtml(status)}</span>  model: ${escapeHtml(engineState.model)}`);
+      if (engineState.progress >= 0 && !engineState.engine) writeLine(`loading progress: ${engineState.progress}%`);
+      if (engineState.lastLatency !== null) writeLine(`last intent latency: ${engineState.lastLatency} ms`);
+      if (engineState.failures) writeLine(`failed load attempts: ${engineState.failures}`, 't-warn');
+      return;
+    }
+    if (action === 'on') {
+      const probe = await detectWebGpu();
+      if (!probe.ok) {
+        cfg.aiEnabled = false;
+        setAiStatus('unavailable');
+        writeBlock(`Kernel AI cannot start: ${probe.reason}`, 'block--error');
+        return;
+      }
+      cfg.aiEnabled = true;
+      setAiStatus(engineState.engine ? 'ready' : 'idle');
+      writeLine('Kernel AI enabled.', 't-ok');
+      return;
+    }
+    if (action === 'off') { cfg.aiEnabled = false; writeLine('Kernel AI disabled. Native Bash still works.', 't-warn'); return; }
+    if (action === 'load' || action === 'warm') {
+      try { await getEngine(); }
+      catch (error) { writeBlock(`[Kernel AI] ${humanizeLoadError(error)}`, 'block--error'); }
+      return;
+    }
+    writeLine(`ai: unknown action '${escapeHtml(action)}'. Use: on, off, load, status.`, 't-warn');
+    return;
+  }
+
+  if (command === 'model') {
+    const requested = tokens.slice(1).join(' ');
+    if (!requested) {
+      writeLine('Available models:');
+      for (const model of MODELS) {
+        const marker = model.id === engineState.model ? '*' : ' ';
+        writeLine(`${marker} <span class="t-dir">${escapeHtml(model.id)}</span>  ${escapeHtml(model.size)}  ${escapeHtml(model.note)}`);
+      }
+      writeLine('Select one with:  model &lt;id&gt;');
+      return;
+    }
+    const match = MODELS.find((model) => model.id.toLowerCase() === requested.toLowerCase())
+      ?? MODELS.find((model) => model.id.toLowerCase().startsWith(requested.toLowerCase()));
+    if (!match) { writeLine(`model: unknown model '${escapeHtml(requested)}'`, 't-err'); return; }
+    if (match.id === engineState.model && engineState.engine) { writeLine(`model: ${escapeHtml(match.id)} already loaded.`); return; }
+    engineState.model = match.id;
+    engineState.engine = null;
+    enginePromise = null;
+    engineState.progress = -1;
+    engineState._shaderLogged = false;
+    setAiStatus('idle');
+    writeLine(`Model set to ${escapeHtml(match.id)} (${escapeHtml(match.size)}). It loads on the next English request.`, 't-ok');
+    return;
+  }
+
+  if (command === 'vfs' || command === 'tree') {
+    writeText(vfsSnapshot());
+    return;
+  }
+
+  if (command === 'reset') {
+    VFS.children = cloneVfs(FACTORY_IMAGE).children;
+    state.cwd = [];
+    writeLine('File system reset to the factory image.', 't-ok');
+  }
+}
+
+const CONTROL_COMMANDS = ['ai', 'model', 'vfs', 'tree', 'reset'];
+
+/* ---------------------------------------------------------------------
+   9. Router
+   ------------------------------------------------------------------ */
+async function submit(rawInput) {
+  if (state.busy) return;
+  const input = String(rawInput).trim();
+
+  inputEl.value = '';
+  state.draft = '';
+  syncCursorState();
+
+  if (input !== '') writeLine(`${promptHtml()} ${escapeHtml(input)}`);
+
+  if (input === '') { setPrompt(); scrollToBottom(); focusInput(); return; }
+  pushHistory(input);
+
+  const tokens = tokenize(input);
+  const head = tokens[0].toLowerCase();
+
+  state.busy = true;
+  setBusyPrompt();
+
+  try {
+    if (CONTROL_COMMANDS.includes(head)) {
+      await handleControlCommand(tokens);
+      return;
+    }
+
+    const normalizedHead = VERB_ALIASES[head] ?? head;
+
+    if (isNativeKeyword(head)) {
+      applyNative([normalizedHead, ...tokens.slice(1)], { echoPrompt: false });
+      return;
+    }
+
+    await runNaturalLanguage(input);
+  } catch (error) {
+    writeBlock(`bash: internal error: ${error?.message ?? error}`, 'block--error');
+  } finally {
+    state.busy = false;
+    setPrompt();
+    scrollToBottom();
+    focusInput();
+  }
+}
+
+/* ---------------------------------------------------------------------
+   10. Boot
+   ------------------------------------------------------------------ */
+/**
+ * Check for a usable WebGPU device. navigator.gpu can exist while no adapter is
+ * available (headless browsers, virtual machines, hardware acceleration off),
+ * so ask for an adapter rather than trusting the presence of the object.
+ */
+async function detectWebGpu() {
+  if (!('gpu' in navigator)) return { ok: false, reason: 'navigator.gpu is missing' };
+  try {
+    const adapter = await navigator.gpu.requestAdapter();
+    if (!adapter) return { ok: false, reason: 'no GPU adapter was returned' };
+    return { ok: true, reason: '' };
+  } catch (error) {
+    return { ok: false, reason: error?.message ?? 'the adapter request failed' };
+  }
+}
+
+function printBanner() {
+  writeLine('<span class="t-ok">Welcome to Ubuntu 26.04 LTS (GNU/Linux 6.14.0-generic x86_64)</span>');
+  writeLine('');
+  writeLine(' * Documentation:  <span class="t-dir">https://help.ubuntu.com</span>');
+  writeLine(' * Management:     <span class="t-dir">https://landscape.canonical.com</span>');
+  writeLine(' * Support:        <span class="t-dir">https://ubuntu.com/pro</span>');
+  writeLine('');
+  writeLine('  System load: 0.08   Memory usage: 21%   Processes: 118');
+  writeLine('  Usage of /:  38.4%  IP address: 10.0.2.15   Swap usage: 0%');
+  writeLine('');
+  writeLine(`<span class="t-warn">[!]</span> This is a simulator. The file system lives in JavaScript and resets on reload.`);
+  writeLine('');
+  writeLine('Run <span class="t-dir">help</span> for commands. Type plain English for the Kernel AI, for example:');
+  writeLine('  <span class="t-dim">create a folder called invoices</span>');
+  writeLine('');
+}
+
+function printWebGpuNotice(probe) {
+  writeBlock(
+    [
+      'Kernel AI is unavailable.',
+      'This browser did not expose WebGPU, so the local model cannot compile.',
+      '',
+      'Native Bash works normally. To enable plain English:',
+      '  use Chrome or Edge 113+, or Safari 18+',
+      '  turn on hardware acceleration in the browser settings',
+      '  avoid remote desktops and virtual machines without GPU passthrough',
+      '',
+      `Detected: ${probe.reason}`,
+      'Run  ai status  to check again.'
+    ].join('\n'),
+    'block--error'
+  );
+}
+
+async function boot() {
+  printBanner();
+  rebuildPrompt();
+  scrollToBottom();
+
+  setAiStatus('checking');
+  const probe = await detectWebGpu();
+  if (probe.ok) {
+    setAiStatus('idle');
+  } else {
+    cfg.aiEnabled = false;
+    setAiStatus('unavailable');
+    printWebGpuNotice(probe);
+  }
+  scrollToBottom();
+}
+
+/* Keep focus on the prompt line at all times. */
+document.addEventListener('pointerdown', (event) => {
+  if (event.target.closest('.hint')) return;
+  if (event.target.closest('.prompt-input')) return;
+  if (event.target.closest('.titlebar')) return;
+  setTimeout(focusInput, 0);
+});
+
+document.addEventListener('keydown', (event) => {
+  if (event.metaKey || event.altKey) return;
+  const typingKey = event.key.length === 1 || ['Backspace', 'Enter', 'ArrowUp', 'ArrowDown'].includes(event.key);
+  if (!typingKey) return;
+  if (document.activeElement === inputEl) return;
+  focusInput();
+});
+
+hintbarEl.addEventListener('click', (event) => {
+  const hint = event.target.closest('.hint');
+  if (!hint || state.busy) return;
+  inputEl.value = hint.dataset.cmd ?? '';
+  state.draft = inputEl.value;
+  syncCursorState();
+  inputEl.focus();
+});
+
+boot();
+
+/* Expose a small console API for debugging without polluting the terminal. */
+window.ubuntuSim = Object.freeze({
+  vfs: () => cloneVfs(),
+  cwd: () => displayPath(state.cwd),
+  engine: () => ({ status: engineState.status, model: engineState.model, progress: engineState.progress })
+});
+</script>
+</body>
+</html>
