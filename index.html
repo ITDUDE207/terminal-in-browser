@@ -325,10 +325,11 @@
   <footer class="hintbar">
     <span>try:</span>
     <span class="hint" data-cmd="ls -la">ls -la</span>
-    <span class="hint" data-cmd="mkdir projects">mkdir projects</span>
+    <span class="hint" data-cmd="help">help</span>
+    <span class="hint" data-cmd="apk help">apk help</span>
+    <span class="hint" data-cmd="sh -c &quot;echo hello | tr a-z A-Z&quot;">sh pipeline</span>
     <span class="hint" data-cmd="create a folder called invoices">create a folder called invoices</span>
     <span class="hint" data-cmd="remove everything inside Documents">remove everything inside Documents</span>
-    <span class="hint" data-cmd="help">help</span>
     <span class="hintbar__sep">|</span>
     <span><kbd>Enter</kbd> run</span>
     <span class="hintbar__sep">|</span>
@@ -690,11 +691,11 @@ function setStatus(label, stateName) {
 /* ---------------------------------------------------------------------
    5. Command catalog
    ------------------------------------------------------------------ */
-const NATIVE_COMMANDS = ['ls', 'mkdir', 'touch', 'rm', 'rmdir', 'cd', 'pwd', 'cat', 'echo', 'clear', 'help', 'date', 'whoami'];
+const NATIVE_COMMANDS = ['ls', 'mkdir', 'touch', 'rm', 'rmdir', 'cd', 'pwd', 'cat', 'echo', 'clear', 'help', 'date', 'whoami', 'apk', 'run', 'sh'];
 
 const USAGE = {
   ls: 'ls [-a] [-l] [path]',
-  mkdir: 'mkdir <name> [name...]',
+  mkdir: 'mkdir [-p] <name> [name...]',
   touch: 'touch <file> [file...]',
   rm: 'rm [-r] <path> [path...]',
   rmdir: 'rmdir <dir> [dir...]',
@@ -705,12 +706,15 @@ const USAGE = {
   clear: 'clear',
   help: 'help [command]',
   date: 'date',
-  whoami: 'whoami'
+  whoami: 'whoami',
+  apk: 'apk <update|add|del|search|info|list|repo|proxy|run> [...]',
+  run: 'run <script> [argument...]',
+  sh: 'sh -c "<script>"'
 };
 
 const DESCRIPTIONS = {
   ls: 'list directory contents',
-  mkdir: 'create directories',
+  mkdir: 'create directories, -p for parents',
   touch: 'create empty files or update timestamps',
   rm: 'remove files and directories',
   rmdir: 'remove empty directories',
@@ -721,7 +725,10 @@ const DESCRIPTIONS = {
   clear: 'clear the screen',
   help: 'list the supported commands',
   date: 'print the current date and time',
-  whoami: 'print the current user'
+  whoami: 'print the current user',
+  apk: 'install real Alpine packages, verified in the browser',
+  run: 'run a script that an installed package provided',
+  sh: 'run a shell script through the POSIX interpreter'
 };
 
 function tokenize(command) {
@@ -788,10 +795,19 @@ function listDirectory(args) {
 }
 
 function makeDirectory(args) {
-  if (args.length === 0) throw new ShellError('mkdir: missing operand');
+  const parents = args.some((a) => a.startsWith('-') && a.includes('p'));
   const names = args.filter((a) => !a.startsWith('-'));
   if (names.length === 0) throw new ShellError('mkdir: missing operand');
   for (const name of names) {
+    if (parents) {
+      const tokens = resolveTokens(name, state.cwd);
+      let node = VFS;
+      for (const token of tokens) {
+        if (!isDir(node.children[token])) node.children[token] = makeDir(token);
+        node = node.children[token];
+      }
+      continue;
+    }
     const target = parentOf(name, state.cwd);
     if (!target) throw new ShellError(`mkdir: cannot create directory '${name}': No such file or directory`);
     if (target.parent.children[target.name]) {
@@ -891,21 +907,29 @@ function printHelp(args) {
     writeLine(`  <span class="t-dir">${escapeHtml(command.padEnd(8))}</span>${escapeHtml(DESCRIPTIONS[command])}`);
   }
   writeLine('');
+  writeLine('<span class="t-ok">POSIX shell</span> (real interpreter over the same file system):');
+  writeLine('  <span class="t-dim">sh -c "for f in /etc/*; do echo $f; done"</span>');
+  writeLine('  <span class="t-dim">run /usr/sbin/lbu --help</span>   run a script from an installed package');
+  writeLine('');
+  writeLine('<span class="t-ok">apk</span> (real Alpine packages, signature verified locally):');
+  writeLine('  <span class="t-dim">apk proxy &lt;cors-proxy-url&gt;</span>   needed once, because the browser blocks direct CORS');
+  writeLine('  <span class="t-dim">apk update</span>                      fetch and verify the repository index');
+  writeLine('  <span class="t-dim">apk add alpine-conf</span>              download, verify and install');
+  writeLine('  <span class="t-dim">apk help</span>                         every apk subcommand');
+  writeLine('');
+  writeLine('<span class="t-ok">Simulator</span> (ai, model, vfs, tree, reset, shell)');
+  writeLine('');
   writeLine('<span class="t-info">Plain English</span> (Route B, compiled by the local model):');
   writeLine('  Any other input is read as intent. Example: <span class="t-dim">create a folder called invoices</span>');
   writeLine('  The model returns JSON such as <span class="t-dim">{"bash":"mkdir","argument":"invoices"}</span>');
 }
 
-/** Route A entry point. Parses a raw command line and runs it. Returns true when handled. */
-function runNative(input) {
-  const tokens = tokenize(input);
-  const command = (tokens.shift() ?? '').toLowerCase();
-  if (!isNativeKeyword(command)) return false;
-  return executeNative(command, tokens);
-}
-
-/** Execute one native command against the VFS. Throws ShellError on failure. */
-function executeNative(command, args) {
+/**
+ * Execute one native command against the VFS. Throws ShellError on failure.
+ * The apk, run and sh commands are asynchronous because they may reach the
+ * network or run a script, so the function is always awaited by its caller.
+ */
+async function executeNative(command, args) {
   switch (command) {
     case 'ls': listDirectory(args); break;
     case 'mkdir': makeDirectory(args); break;
@@ -920,9 +944,44 @@ function executeNative(command, args) {
     case 'date': writeLine(escapeHtml(new Date().toString())); break;
     case 'whoami': writeLine(escapeHtml(cfg.user)); break;
     case 'clear': clearScreen(); break;
+    case 'apk': await handleApkCommand(['apk', ...args]); break;
+    case 'run': {
+      if (args.length === 0) throw new ShellError('run: missing script path');
+      await runShellScript(args[0], args.slice(1));
+      break;
+    }
+    case 'sh': {
+      if (args[0] === '-c') await runShellSource(args.slice(1).join(' '));
+      else if (args[0]) await runShellScript(args[0], args.slice(1));
+      else throw new ShellError('sh: missing script');
+      break;
+    }
     default: return false;
   }
   return true;
+}
+
+/** Run shell source text typed at the prompt, streaming output to the terminal. */
+async function runShellSource(source) {
+  const shell = new Shell({
+    cwd: state.cwd,
+    env: { PATH: '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', HOME: '/root', PS1: '$ ' }
+  });
+  shell.fs = VFS;
+  let status = 0;
+  try {
+    shell.run(source, {
+      stdin: '',
+      stdout: (text) => shellEmitLine(text),
+      stderr: (text) => shellEmitLine(text)
+    });
+    status = shell.lastStatus;
+  } catch (error) {
+    if (error instanceof ShellExit) status = error.code;
+    else writeLine(escapeHtml(error?.message ?? String(error)), 't-err');
+  }
+  state.cwd = shell.cwd;
+  if (status !== 0) writeLine(`<span class="t-dim">[sh] exit ${status}</span>`);
 }
 
 /* ---------------------------------------------------------------------
@@ -937,12 +996,14 @@ Allowed keys:
 {"bash": string, "argument": string, "arguments": string[], "reply": string}
 
 Rules:
-1. "bash" must be one of: ls, mkdir, touch, rm, rmdir, cd, pwd, cat, echo, clear.
+1. "bash" must be one of: ls, mkdir, touch, rm, rmdir, cd, pwd, cat, echo, clear, apk.
 2. Put a single target in "argument", or several targets in "arguments".
 3. Use rm with "recursive": true to delete a directory and its contents.
-4. Put a short spoken confirmation in "reply" only when no command applies.
-5. Never invent a path that is not listed in the file system state.
-6. Output JSON only.`;
+4. To install or remove a package, use bash "apk" with "arguments": ["add", "<package>"]
+   or ["del", "<package>"].
+5. Put a short spoken confirmation in "reply" only when no command applies.
+6. Never invent a path that is not listed in the file system state.
+7. Output JSON only.`;
 
 const MODELS = [
   { id: MODEL_ID, label: 'Llama-3.2-1B-Instruct-q4f16_1-MLC', size: '~900 MB', note: 'default' },
@@ -1117,18 +1178,20 @@ const ACTION_ALIASES = {
   pwd: 'pwd', cwd: 'pwd',
   cat: 'cat', read: 'cat', show: 'cat', print: 'cat',
   echo: 'echo',
-  clear: 'clear', cls: 'clear'
+  clear: 'clear', cls: 'clear',
+  apk: 'apk', install: 'apk', package: 'apk', packages: 'apk'
 };
 
-/* Spoken words a person may type instead of the utility name. */
+/*
+ * Shortcuts typed instead of the utility name. Only unambiguous shell-isms
+ * belong here: a common English word such as "delete" or "install" must fall
+ * through to the Kernel AI, otherwise the rest of the sentence is read as
+ * arguments and the user gets a confusing error.
+ */
 const VERB_ALIASES = {
-  clean: 'clear',
-  cls: 'clear',
-  wipe: 'clear',
   dir: 'ls',
-  delete: 'rm',
-  remove: 'rm',
-  erase: 'rm'
+  cls: 'clear',
+  ll: 'ls'
 };
 
 function isNativeKeyword(word) {
@@ -1155,6 +1218,10 @@ function normalizeArguments(action, parsed) {
 /** Turn a validated model object into argv tokens for the native engine. */
 function buildArgv(action, parsed) {
   const args = normalizeArguments(action, parsed);
+  if (action === 'apk') {
+    if (args.length === 0) throw new ShellError('apk: missing subcommand');
+    return [action, ...args];
+  }
   if (action === 'rm' && args.length === 0) throw new ShellError('rm: missing operand');
   if (action === 'rmdir' && args.length === 0) throw new ShellError('rmdir: missing operand');
   if (action === 'touch' && args.length === 0) throw new ShellError('touch: missing file operand');
@@ -1230,23 +1297,2819 @@ async function runNaturalLanguage(request) {
 
   const command = argv.map((part) => (/\s/.test(part) ? JSON.stringify(part) : part)).join(' ');
   writeLine(`${promptHtml()} ${escapeHtml(command)}`);
-  applyNative(argv, { echoPrompt: false });
+  await applyNative(argv, { echoPrompt: false });
 }
 
 /** Run argv through Route A without re-entering the router. */
-function applyNative(argv, { echoPrompt = true } = {}) {
+async function applyNative(argv, { echoPrompt = true } = {}) {
   const [command, ...args] = argv;
   if (echoPrompt) writeLine(`${promptHtml()} ${escapeHtml(argv.join(' '))}`);
   try {
-    if (!executeNative(command, args)) throw new ShellError(`${command}: command not found`);
+    if (!await executeNative(command, args)) throw new ShellError(`${command}: command not found`);
+    return 0;
   } catch (error) {
     const message = error instanceof ShellError ? error.message : `bash: ${command}: ${error?.message ?? error}`;
     writeLine(escapeHtml(message), 't-err');
+    return 1;
   }
 }
 
 /* ---------------------------------------------------------------------
-   8. Simulator control commands (ai, model)
+   8. Shell interpreter
+   --------------------------------------------------------------------- */
+/* Package maintainer scripts are shell scripts. Running them needs a shell,
+   so this is a small POSIX-style interpreter that operates on the VFS.
+
+   Supported: quoting, parameter expansion, command substitution, pipelines,
+   redirection, && and ||, if / while / for / case, functions, and the
+   builtins listed in SHELL_BUILTINS.
+
+   Not supported: job control, subshells as background jobs, process
+   substitution, heredocs, and arithmetic expansion.
+   ------------------------------------------------------------------ */
+
+const SHELL_OPERATORS = ['&&', '||', '2>&1', '2>>', '2>', '>>', ';;', '|', ';', '>', '<', '&', '(', ')'];
+
+/** Split shell source into tokens, keeping quotes and expansions intact. */
+function shellTokenize(source) {
+  const tokens = [];
+  let current = '';
+  let quote = '';
+  let depth = 0;
+  let index = 0;
+
+  const flush = () => { if (current !== '') { tokens.push(current); current = ''; } };
+
+  while (index < source.length) {
+    const character = source[index];
+
+    if (quote === "'") {
+      current += character;
+      if (character === "'") quote = '';
+      index++;
+      continue;
+    }
+
+    if (quote === '"') {
+      if (character === '\\' && index + 1 < source.length) {
+        current += character + source[index + 1];
+        index += 2;
+        continue;
+      }
+      current += character;
+      if (character === '"') quote = '';
+      index++;
+      continue;
+    }
+
+    // Command substitution: consume the whole $( ... ) as one run.
+    if (character === '$' && source[index + 1] === '(') {
+      let scan = index + 2;
+      let nesting = 1;
+      let inner = '';
+      while (scan < source.length && nesting > 0) {
+        const c = source[scan];
+        if (c === '\\') { inner += c + (source[scan + 1] ?? ''); scan += 2; continue; }
+        if (c === '(') nesting++;
+        if (c === ')') { nesting--; if (nesting === 0) break; }
+        inner += c;
+        scan++;
+      }
+      current += '$(' + inner + ')';
+      index = scan + 1;
+      continue;
+    }
+
+    if (character === '`') {
+      const close = source.indexOf('`', index + 1);
+      const inner = close === -1 ? source.slice(index + 1) : source.slice(index + 1, close);
+      current += '`' + inner + '`';
+      index = close === -1 ? source.length : close + 1;
+      continue;
+    }
+
+    if (character === '#') {
+      // A comment only starts at the beginning of a word.
+      if (current === '') {
+        while (index < source.length && source[index] !== '\n') index++;
+        continue;
+      }
+    }
+
+    if (character === "'" || character === '"') {
+      quote = character;
+      current += character;
+      index++;
+      continue;
+    }
+
+    if (character === '\\' && index + 1 < source.length) {
+      current += character + source[index + 1];
+      index += 2;
+      continue;
+    }
+
+    if (source.startsWith(';;', index)) {
+      flush();
+      tokens.push(';;');
+      index += 2;
+      continue;
+    }
+
+    if (character === '\n' || character === ';') {
+      flush();
+      if (tokens[tokens.length - 1] !== ';') tokens.push(';');
+      index++;
+      continue;
+    }
+
+    if (/\s/.test(character)) {
+      flush();
+      index++;
+      continue;
+    }
+
+    if (character === '(' || character === ')') {
+      flush();
+      tokens.push(character);
+      index++;
+      continue;
+    }
+
+    const operator = SHELL_OPERATORS.find((candidate) => source.startsWith(candidate, index));
+    if (operator) {
+      flush();
+      tokens.push(operator);
+      index += operator.length;
+      continue;
+    }
+
+    current += character;
+    index++;
+  }
+  flush();
+  if (tokens[tokens.length - 1] === ';') tokens.pop();
+  return tokens;
+}
+
+/** Split a token into words on unquoted whitespace, for globbing. */
+function shellWords(value) {
+  return String(value).split(/\s+/).filter(Boolean);
+}
+
+/** A failure that carries an exit code rather than a stack. */
+class ShellExit extends Error {
+  constructor(code = 0) {
+    super(`exit ${code}`);
+    this.code = code;
+  }
+}
+
+/**
+ * The shell. Holds variables, the working directory and the streams for one
+ * script run. Package scripts get a fresh instance so they cannot leak state.
+ */
+class Shell {
+  constructor({ stdin = '', cwd = [], env = {} } = {}) {
+    this.vars = new Map(Object.entries(env));
+    this.cwd = [...cwd];
+    this.stdin = stdin;
+    this.stdout = [];
+    this.stderr = [];
+    this.exitCode = 0;
+    this.functions = new Map();
+    this.lastStatus = 0;
+    this.steps = 0;
+    this.stepLimit = 20000;
+    this.fs = null;
+  }
+
+  out(text) { this.stdout.push(String(text)); }
+
+  err(text) { this.stderr.push(String(text)); }
+
+  write(fd, text) { if (fd === 2) this.err(text); else this.out(text); }
+}
+
+/* --- word expansion --------------------------------------------------- */
+
+function shellExpand(token, shell, { allowGlob = true } = {}) {
+  if (token === '') return '';
+
+  // Command substitution, outermost only, evaluated first.
+  let value = token;
+
+  const runSubstitution = (inner) => {
+    const child = new Shell({ cwd: shell.cwd, env: Object.fromEntries(shell.vars), fs: shell.fs });
+    child.functions = shell.functions;
+    try {
+      child.run(inner);
+    } catch (error) {
+      if (!(error instanceof ShellExit)) child.err(error?.message ?? String(error));
+    }
+    return child.stdout.join('\n').replace(/\n+$/, '');
+  };
+
+  let expanded = '';
+  let index = 0;
+  let quote = '';
+  while (index < value.length) {
+    const character = value[index];
+
+    if (character === '\\' && quote !== "'" && index + 1 < value.length) {
+      const escaped = value[index + 1];
+      // Inside double quotes a backslash only escapes these four characters.
+      if (quote === '"' && !'"\\$`'.includes(escaped)) {
+        expanded += '\\' + escaped;
+      } else {
+        expanded += escaped;
+      }
+      index += 2;
+      continue;
+    }
+
+    if (character === "'" && quote !== '"') {
+      const close = value.indexOf("'", index + 1);
+      const inner = close === -1 ? value.slice(index + 1) : value.slice(index + 1, close);
+      expanded += inner;
+      index = close === -1 ? value.length : close + 1;
+      continue;
+    }
+
+    if (character === '"' && quote !== "'") {
+      if (quote === '"') { quote = ''; index++; continue; }
+      quote = '"';
+      index++;
+      continue;
+    }
+
+    if (character === '$' && value[index + 1] === '(' && value[index + 2] === '(') {
+      const close = value.indexOf('))', index + 3);
+      if (close !== -1) {
+        expanded += String(shellArithmetic(value.slice(index + 3, close), shell));
+        index = close + 2;
+        continue;
+      }
+    }
+
+    if (character === '$' && value[index + 1] === '(') {
+      let scan = index + 2;
+      let nesting = 1;
+      let inner = '';
+      while (scan < value.length && nesting > 0) {
+        const c = value[scan];
+        if (c === '(') nesting++;
+        if (c === ')') { nesting--; if (nesting === 0) break; }
+        inner += c;
+        scan++;
+      }
+      expanded += runSubstitution(inner);
+      index = scan + 1;
+      continue;
+    }
+
+    if (character === '`') {
+      const close = value.indexOf('`', index + 1);
+      const inner = close === -1 ? value.slice(index + 1) : value.slice(index + 1, close);
+      expanded += runSubstitution(inner);
+      index = close === -1 ? value.length : close + 1;
+      continue;
+    }
+
+    if (character === '$' && value[index + 1] === '{') {
+      const close = value.indexOf('}', index + 2);
+      if (close === -1) { expanded += character; index++; continue; }
+      const expression = value.slice(index + 2, close);
+      expanded += shellParameter(shell, expression);
+      index = close + 1;
+      continue;
+    }
+
+    if (character === '$') {
+      const match = /^\$([A-Za-z_][A-Za-z0-9_]*|[0-9@*#?$!-])/.exec(value.slice(index));
+      if (match) {
+        expanded += shellParameter(shell, match[1]);
+        index += match[0].length;
+        continue;
+      }
+    }
+
+    expanded += character;
+    index++;
+  }
+
+  if (!allowGlob) return expanded;
+  if (!/[*?]/.test(expanded)) return expanded;
+  return shellGlob(expanded, shell).join('\u0000') === '' ? expanded : shellGlob(expanded, shell).join('\u0000');
+}
+
+/**
+ * Evaluate an arithmetic expression for $(( ... )).
+ * Supports + - * / % and parentheses. Not a full integer expression parser.
+ */
+function shellArithmetic(expression, shell) {
+  const source = expression.replace(/\$?([A-Za-z_][A-Za-z0-9_]*)/g, (_, name) => {
+    const value = shell.vars.get(name);
+    return value === undefined || value === '' ? '0' : String(value);
+  });
+
+  let at = 0;
+  const skipSpace = () => { while (at < source.length && /\s/.test(source[at])) at++; };
+
+  const parsePrimary = () => {
+    skipSpace();
+    if (source[at] === '(') {
+      at++;
+      const value = parseSum();
+      skipSpace();
+      if (source[at] === ')') at++;
+      return value;
+    }
+    if (source[at] === '-') { at++; return -parsePrimary(); }
+    const match = /^\d+/.exec(source.slice(at));
+    if (!match) { at++; return 0; }
+    at += match[0].length;
+    return Number(match[0]);
+  };
+
+  const parseProduct = () => {
+    let value = parsePrimary();
+    for (;;) {
+      skipSpace();
+      const operator = source[at];
+      if (operator !== '*' && operator !== '/' && operator !== '%') return value;
+      at++;
+      const right = parsePrimary();
+      if (operator === '*') value *= right;
+      else if (operator === '/') value = right === 0 ? 0 : Math.trunc(value / right);
+      else value = right === 0 ? 0 : value % right;
+    }
+  };
+
+  function parseSum() {
+    let value = parseProduct();
+    for (;;) {
+      skipSpace();
+      const operator = source[at];
+      if (operator !== '+' && operator !== '-') return value;
+      at++;
+      const right = parseProduct();
+      value = operator === '+' ? value + right : value - right;
+    }
+  }
+
+  return parseSum();
+}
+
+/** Resolve a ${...} or $X expression. */
+function shellParameter(shell, expression) {
+  const defaultValue = /^([A-Za-z_][A-Za-z0-9_]*):-([\s\S]*)$/.exec(expression);
+  if (defaultValue) {
+    const current = shell.vars.get(defaultValue[1]);
+    return current === undefined || current === '' ? defaultValue[2] : current;
+  }
+  const assignDefault = /^([A-Za-z_][A-Za-z0-9_]*):=([\s\S]*)$/.exec(expression);
+  if (assignDefault) {
+    const current = shell.vars.get(assignDefault[1]);
+    if (current === undefined || current === '') {
+      shell.vars.set(assignDefault[1], assignDefault[2]);
+      return assignDefault[2];
+    }
+    return current;
+  }
+  if (expression === '@' || expression === '*') return (shell.vars.get('@') ?? '').split('\u0001').join(' ');
+  if (expression === '#') return String(shell.vars.get('#') ?? 0);
+  if (expression === '?') return String(shell.lastStatus);
+  if (/^\d+$/.test(expression)) {
+    const positional = shell.vars.get('@');
+    if (positional === undefined) return '';
+    return positional.split('\u0001')[Number(expression) - 1] ?? '';
+  }
+  return shell.vars.get(expression) ?? '';
+}
+
+/** Expand a glob pattern against the VFS. Returns matching paths. */
+function shellGlob(pattern, shell) {
+  const base = pattern.startsWith('/') ? [] : [...shell.cwd];
+  const segments = pattern.split('/');
+  let candidates = [base];
+
+  for (const segment of segments) {
+    if (segment === '' || segment === '.') continue;
+    const next = [];
+    for (const prefix of candidates) {
+      if (!/[*?]/.test(segment)) {
+        const tokens = segment === '..' ? prefix.slice(0, -1) : [...prefix, segment];
+        if (shellLookup(shell, tokens)) next.push(tokens);
+        continue;
+      }
+      const parent = shellLookup(shell, prefix);
+      if (!parent || !isDir(parent)) continue;
+      const expression = new RegExp('^' + segment.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.') + '$');
+      for (const name of Object.keys(parent.children)) {
+        if (expression.test(name)) next.push([...prefix, name]);
+      }
+    }
+    candidates = next;
+  }
+
+  return candidates.map((tokens) => (pattern.startsWith('/') ? '/' : '') + tokens.join('/')).filter(Boolean);
+}
+
+/* --- VFS access from the shell --------------------------------------- */
+
+function shellLookup(shell, tokens) {
+  let node = shell.fs ?? VFS;
+  for (const token of tokens) {
+    if (!isDir(node)) return null;
+    node = node.children[token];
+    if (!node) return null;
+  }
+  return node;
+}
+
+/** Resolve a shell path string into VFS tokens. */
+function shellResolve(shell, path) {
+  const value = String(path);
+  if (value === '' || value === '.') return [...shell.cwd];
+  if (value === '/') return [];
+  if (value.startsWith('/')) return normalizeSegments(value.split('/'));
+  return normalizeSegments([...shell.cwd, ...value.split('/')]);
+}
+
+function shellParent(shell, path) {
+  const tokens = shellResolve(shell, path);
+  const name = tokens[tokens.length - 1];
+  const parentTokens = tokens.slice(0, -1);
+  const parent = shellLookup(shell, parentTokens);
+  return isDir(parent) && name ? { parent, name, tokens } : null;
+}
+
+function shellPath(shell, path) {
+  const tokens = shellResolve(shell, path);
+  return tokens.length === 0 ? '/' : '/' + tokens.join('/');
+}
+
+/** Create every missing directory on the path, like mkdir -p. */
+function shellEnsureDir(shell, path) {
+  const tokens = shellResolve(shell, path);
+  let node = shell.fs ?? VFS;
+  for (const token of tokens) {
+    if (!isDir(node.children[token])) node.children[token] = makeDir(token, {});
+    node = node.children[token];
+  }
+  return node;
+}
+
+function shellWriteFile(shell, path, content, { append = false } = {}) {
+  const resolved = shellParent(shell, path);
+  if (!resolved) throw new Error(`cannot create ${path}`);
+  const existing = resolved.parent.children[resolved.name];
+  if (append && existing && existing.type === 'file') {
+    existing.content += content;
+    return existing;
+  }
+  resolved.parent.children[resolved.name] = makeFile(resolved.name, content, { from: 'shell' });
+  return resolved.parent.children[resolved.name];
+}
+
+function shellReadFile(shell, path) {
+  const node = shellLookup(shell, shellResolve(shell, path));
+  if (!node) return null;
+  if (node.type === 'dir') return null;
+  return node.content ?? '';
+}
+
+/* --- parser ----------------------------------------------------------- */
+
+const RESERVED_WORDS = new Set([
+  'if', 'then', 'else', 'elif', 'fi', 'while', 'until', 'for', 'in', 'do', 'done',
+  'case', 'esac', 'function', '{', '}', '(', ')'
+]);
+
+/**
+ * Recursive descent parser over the token list.
+ * Produces a small AST the executor walks.
+ */
+class ShellParser {
+  constructor(tokens) {
+    this.tokens = tokens;
+    this.at = 0;
+  }
+
+  peek(offset = 0) { return this.tokens[this.at + offset]; }
+
+  next() { return this.tokens[this.at++]; }
+
+  atEnd() { return this.at >= this.tokens.length; }
+
+  isReserved(word) { return typeof word === 'string' && RESERVED_WORDS.has(word); }
+
+  /** Consume tokens until the reserved word that closes the current block. */
+  takeUntilReserved(stops) {
+    const collected = [];
+    let depth = 0;
+    while (!this.atEnd()) {
+      const token = this.peek();
+      if (depth === 0 && stops.includes(token)) break;
+      if (token === 'if' || token === 'while' || token === 'until' || token === 'for' || token === 'case') depth++;
+      if (token === 'fi' || token === 'done' || token === 'esac') depth--;
+      collected.push(this.next());
+    }
+    return collected;
+  }
+
+  parseScript(stops = []) {
+    const body = this.takeUntilReserved(stops);
+    return this.parseList(body);
+  }
+
+  parseList(tokens) {
+    const parser = new ShellParser(tokens);
+    const items = [];
+    while (!parser.atEnd()) {
+      if (parser.peek() === ';') { parser.next(); continue; }
+      const before = parser.at;
+      items.push(parser.parseAndOr());
+      // Guarantee forward progress. A stray reserved word such as a trailing
+      // 'fi' or 'esac' would otherwise make parseAndOr return an empty node
+      // without consuming anything, and this loop would never end.
+      if (parser.at === before) parser.next();
+      if (parser.peek() === ';') parser.next();
+    }
+    return { type: 'list', items };
+  }
+
+  parseAndOr() {
+    let node = this.parsePipeline();
+    while (this.peek() === '&&' || this.peek() === '||') {
+      const operator = this.next();
+      const right = this.parsePipeline();
+      node = { type: 'andor', left: node, operator, right };
+    }
+    return node;
+  }
+
+  parsePipeline() {
+    const commands = [this.parseCommand()];
+    while (this.peek() === '|') {
+      this.next();
+      commands.push(this.parseCommand());
+    }
+    return { type: 'pipeline', commands };
+  }
+
+  parseCommand() {
+    const token = this.peek();
+
+    if (token === 'if') return this.parseIf();
+    if (token === 'while' || token === 'until') return this.parseWhile();
+    if (token === 'for') return this.parseFor();
+    if (token === 'case') return this.parseCase();
+    if (token === '{') return this.parseBraceGroup();
+    if (token === '(') return this.parseSubshell();
+
+    // A function definition looks like: name () { ... }
+    if (typeof token === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(token)
+      && this.peek(1) === '(' && this.peek(2) === ')') {
+      const name = this.next();
+      this.next();
+      this.next();
+      const body = this.parseCommand();
+      return { type: 'function', name, body };
+    }
+
+    return this.parseSimple();
+  }
+
+  parseSimple() {
+    const words = [];
+    const redirects = [];
+    while (!this.atEnd()) {
+      const token = this.peek();
+      if (token === ';' || token === '&&' || token === '||' || token === '|' || token === ')') break;
+      if (token === '>' || token === '>>' || token === '<' || token === '2>&1') {
+        this.next();
+        const target = this.next() ?? '';
+        redirects.push({ operator: token, target });
+        continue;
+      }
+      if (this.isReserved(token)) break;
+      words.push(this.next());
+    }
+    return { type: 'simple', words, redirects };
+  }
+
+  parseIf() {
+    this.next(); // if
+    const condition = this.parseScript(['then']);
+    this.next(); // then
+    const thenBody = this.parseScript(['elif', 'else', 'fi']);
+    const branches = [];
+    let elseBody = null;
+    while (this.peek() === 'elif') {
+      this.next();
+      const branchCondition = this.parseScript(['then']);
+      this.next(); // then
+      branches.push({ condition: branchCondition, body: this.parseScript(['elif', 'else', 'fi']) });
+    }
+    if (this.peek() === 'else') {
+      this.next();
+      elseBody = this.parseScript(['fi']);
+    }
+    if (this.peek() === 'fi') this.next();
+    return { type: 'if', condition, thenBody, branches, elseBody };
+  }
+
+  parseWhile() {
+    const until = this.next() === 'until';
+    const condition = this.parseScript(['do']);
+    this.next(); // do
+    const body = this.parseScript(['done']);
+    if (this.peek() === 'done') this.next();
+    return { type: 'while', until, condition, body };
+  }
+
+  parseFor() {
+    this.next(); // for
+    const name = this.next();
+    let words = [];
+    if (this.peek() === 'in') {
+      this.next();
+      while (!this.atEnd() && this.peek() !== ';' && this.peek() !== 'do') words.push(this.next());
+    }
+    if (this.peek() === ';') this.next();
+    if (this.peek() === 'do') this.next();
+    const body = this.parseScript(['done']);
+    if (this.peek() === 'done') this.next();
+    return { type: 'for', name, words, body };
+  }
+
+  parseCase() {
+    this.next(); // case
+    const word = this.next();
+    if (this.peek() === 'in') this.next();
+    const items = [];
+    while (!this.atEnd() && this.peek() !== 'esac') {
+      if (this.peek() === ';') { this.next(); continue; }
+      const patterns = [];
+      while (!this.atEnd() && this.peek() !== ')') patterns.push(this.next());
+      if (this.peek() === ')') this.next();
+      const bodyTokens = [];
+      let depth = 0;
+      while (!this.atEnd()) {
+        const token = this.peek();
+        if (token === 'if' || token === 'while' || token === 'for' || token === 'case') depth++;
+        if (token === 'fi' || token === 'done' || token === 'esac') depth--;
+        if (depth === 0 && token === ';;') { this.next(); break; }
+        if (depth === 0 && token === 'esac') break;
+        bodyTokens.push(this.next());
+      }
+      items.push({ patterns: patterns.join(' ').split('|'), body: this.parseList(bodyTokens) });
+    }
+    if (this.peek() === 'esac') this.next();
+    return { type: 'case', word, items };
+  }
+
+  parseBraceGroup() {
+    this.next(); // {
+    const body = this.parseScript(['}']);
+    if (this.peek() === '}') this.next();
+    return { type: 'group', body };
+  }
+
+  parseSubshell() {
+    this.next(); // (
+    const body = this.parseScript([')']);
+    if (this.peek() === ')') this.next();
+    return { type: 'subshell', body };
+  }
+}
+
+/* --- executor --------------------------------------------------------- */
+
+class ShellReturn extends Error {
+  constructor(code) { super(`return ${code}`); this.code = code; }
+}
+
+/** Execute an AST node. Returns the exit status. */
+function shellExecNode(node, shell, io) {
+  if (!node) return 0;
+  if (++shell.steps > shell.stepLimit) throw new ShellExit(1);
+
+  switch (node.type) {
+    case 'list': {
+      let status = 0;
+      for (const item of node.items) status = shellExecNode(item, shell, io);
+      return status;
+    }
+    case 'andor': {
+      const left = shellExecNode(node.left, shell, io);
+      if (node.operator === '&&') return left === 0 ? shellExecNode(node.right, shell, io) : left;
+      return left !== 0 ? shellExecNode(node.right, shell, io) : left;
+    }
+    case 'pipeline':
+      return shellExecPipeline(node, shell, io);
+    case 'simple':
+      return shellExecSimple(node, shell, io);
+    case 'if': {
+      if (shellExecNode(node.condition, shell, io) === 0) return shellExecNode(node.thenBody, shell, io);
+      for (const branch of node.branches) {
+        if (shellExecNode(branch.condition, shell, io) === 0) return shellExecNode(branch.body, shell, io);
+      }
+      return node.elseBody ? shellExecNode(node.elseBody, shell, io) : 0;
+    }
+    case 'while': {
+      let status = 0;
+      let guard = 0;
+      for (;;) {
+        if (++guard > 100000) break;
+        const condition = shellExecNode(node.condition, shell, io);
+        const keepGoing = node.until ? condition !== 0 : condition === 0;
+        if (!keepGoing) break;
+        status = shellExecNode(node.body, shell, io);
+      }
+      return status;
+    }
+    case 'for': {
+      const values = [];
+      for (const word of node.words) {
+        const expanded = shellExpand(word, shell, { allowGlob: false });
+        values.push(...shellWords(expanded));
+      }
+      let status = 0;
+      for (const value of values) {
+        shell.vars.set(node.name, value);
+        status = shellExecNode(node.body, shell, io);
+      }
+      return status;
+    }
+    case 'case': {
+      const value = shellExpand(node.word, shell, { allowGlob: false });
+      for (const item of node.items) {
+        for (const pattern of item.patterns) {
+          const expression = new RegExp('^' + pattern.trim()
+            .replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.') + '$');
+          if (expression.test(value)) return shellExecNode(item.body, shell, io);
+        }
+      }
+      return 0;
+    }
+    case 'group':
+    case 'subshell':
+      return shellExecNode(node.body, shell, io);
+    case 'function':
+      shell.functions.set(node.name, node.body);
+      return 0;
+    default:
+      return 0;
+  }
+}
+
+/** Run a pipeline, feeding each command's stdout into the next stdin. */
+function shellExecPipeline(node, shell, io) {
+  let input = io.stdin;
+  let status = 0;
+  for (let index = 0; index < node.commands.length; index++) {
+    const command = node.commands[index];
+    const captured = [];
+    const isLast = index === node.commands.length - 1;
+    const stageIo = {
+      stdin: input,
+      stdout: (text) => (isLast ? io.stdout(text) : captured.push(text)),
+      stderr: io.stderr
+    };
+    status = shellExecNode(command, shell, stageIo);
+    input = captured.join('');
+  }
+  return status;
+}
+
+/** Collect the words of a simple command, expanding and globbing. */
+function shellExpandWords(words, shell) {
+  const expanded = [];
+  for (const word of words) {
+    const value = shellExpand(word, shell);
+    if (value.includes('\u0000')) expanded.push(...value.split('\u0000'));
+    else if (value !== '') expanded.push(value);
+  }
+  return expanded;
+}
+
+function shellExecSimple(node, shell, io) {
+  const argv = shellExpandWords(node.words, shell);
+
+  // A bare assignment (NAME=value) sets a variable and produces no output.
+  if (argv.length > 0 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(argv[0])) {
+    for (const word of argv) {
+      const equals = word.indexOf('=');
+      if (equals <= 0) continue;
+      shell.vars.set(word.slice(0, equals), word.slice(equals + 1));
+    }
+    shell.lastStatus = 0;
+    return 0;
+  }
+
+  if (argv.length === 0) return 0;
+
+  // Apply redirections to this command's streams.
+  let stdout = io.stdout;
+  let stderr = io.stderr;
+  let stdin = io.stdin;
+
+  for (const redirect of node.redirects) {
+    const target = shellExpand(redirect.target, shell, { allowGlob: false });
+    if (redirect.operator === '2>&1') { stderr = stdout; continue; }
+    if (redirect.operator === '<') { stdin = shellReadFile(shell, target) ?? ''; continue; }
+    if (redirect.operator === '2>' || redirect.operator === '2>>') {
+      const buffer = [];
+      stderr = (text) => buffer.push(text);
+      stderr.flush = () => shellWriteFile(shell, shellPath(shell, target), buffer.join(''),
+        { append: redirect.operator === '2>>' });
+      continue;
+    }
+    const path = shellPath(shell, target);
+    const buffer = [];
+    stdout = (text) => buffer.push(text);
+    stdout.flush = () => {
+      shellWriteFile(shell, path, buffer.join(''), { append: redirect.operator === '>>' });
+    };
+  }
+
+  const status = shellRunCommand(argv, shell, { stdin, stdout, stderr });
+  for (const stream of [stdout, stderr]) if (typeof stream.flush === 'function') stream.flush();
+  shell.lastStatus = status;
+  return status;
+}
+
+/** Dispatch one command: function, builtin, then external simulation. */
+function shellRunCommand(argv, shell, io) {
+  const [name, ...args] = argv;
+
+  if (shell.functions.has(name)) {
+    const body = shell.functions.get(name);
+    // A function sees its own positional parameters, saved and restored around
+    // the call so the caller's $1 and $@ survive.
+    const savedPositional = shell.vars.get('@');
+    const savedCount = shell.vars.get('#');
+    shell.vars.set('@', args.join('\u0001'));
+    shell.vars.set('#', String(args.length));
+    try {
+      return shellExecNode(body, shell, io);
+    } catch (error) {
+      if (error instanceof ShellReturn) return error.code;
+      throw error;
+    } finally {
+      if (savedPositional === undefined) shell.vars.delete('@');
+      else shell.vars.set('@', savedPositional);
+      if (savedCount === undefined) shell.vars.delete('#');
+      else shell.vars.set('#', savedCount);
+    }
+  }
+
+  if (SHELL_BUILTINS[name]) return SHELL_BUILTINS[name](args, shell, io);
+  return shellRunExternal(name, args, shell, io);
+}
+
+/* --- builtins --------------------------------------------------------- */
+
+/**
+ * Builtins, keyed by name. Each returns an exit status.
+ * Path helpers keep the code short: everything operates on the VFS.
+ */
+const SHELL_BUILTINS = {
+  ':': () => 0,
+  true: () => 0,
+  false: () => 1,
+
+  echo(args, shell, io) {
+    let newline = true;
+    let index = 0;
+    if (args[0] === '-n') { newline = false; index = 1; }
+    let text = args.slice(index).join(' ');
+    // busybox ash and dash both interpret backslash escapes in echo.
+    let stop = false;
+    text = text.replace(/\\([ntr0\\c])/g, (_, code) => {
+      if (code === 'c') { stop = true; return ''; }
+      return { n: '\n', t: '\t', r: '\r', '0': '\0', '\\': '\\' }[code];
+    });
+    if (stop) { io.stdout(text); return 0; }
+    io.stdout(newline ? text + '\n' : text);
+    return 0;
+  },
+
+  printf(args, shell, io) {
+    if (args.length === 0) return 0;
+    const format = args[0];
+    const values = args.slice(1);
+    let at = 0;
+    const output = format
+      .replace(/\\([ntr\\])/g, (_, c) => ({ n: '\n', t: '\t', r: '\r', '\\': '\\' }[c]))
+      .replace(/%[sdi]/g, () => values[at++] ?? '');
+    io.stdout(output);
+    return 0;
+  },
+
+  pwd(args, shell, io) { io.stdout(shellPath(shell, '.') + '\n'); return 0; },
+
+  cd(args, shell, io) {
+    const target = args[0] ?? '~';
+    if (target === '~' || target === '$HOME') { shell.cwd = []; return 0; }
+    const tokens = shellResolve(shell, target);
+    const node = shellLookup(shell, tokens);
+    if (!node) { io.stderr(`sh: cd: ${target}: No such file or directory\n`); return 1; }
+    if (!isDir(node)) { io.stderr(`sh: cd: ${target}: Not a directory\n`); return 1; }
+    shell.cwd = tokens;
+    return 0;
+  },
+
+  local(args, shell) {
+    // Treated as a plain assignment. Scripts use local for isolation, which a
+    // single-scope interpreter cannot provide, but the value must still be set.
+    for (const assignment of args) {
+      const equals = assignment.indexOf('=');
+      if (equals <= 0) continue;
+      shell.vars.set(assignment.slice(0, equals), assignment.slice(equals + 1));
+    }
+    return 0;
+  },
+
+  export(args, shell) {
+    for (const assignment of args) {
+      const equals = assignment.indexOf('=');
+      if (equals === -1) continue;
+      shell.vars.set(assignment.slice(0, equals), assignment.slice(equals + 1));
+    }
+    return 0;
+  },
+
+  unset(args, shell) {
+    for (const name of args) shell.vars.delete(name);
+    return 0;
+  },
+
+  set(args, shell) {
+    if (args.length === 0) return 0;
+    if (args[0] === '--') return 0;
+    return 0;
+  },
+
+  shift(args, shell) {
+    const positional = (shell.vars.get('@') ?? '').split('\u0001');
+    positional.shift();
+    shell.vars.set('@', positional.join('\u0001'));
+    return 0;
+  },
+
+  read(args, shell, io) {
+    const name = args[0] ?? 'REPLY';
+    const [line = ''] = String(io.stdin ?? '').split('\n');
+    shell.vars.set(name, line.trim());
+    return 0;
+  },
+
+  test(args, shell, io) { return shellTest(args, shell, io); },
+  '['(args, shell, io) {
+    const trimmed = args[args.length - 1] === ']' ? args.slice(0, -1) : args;
+    return shellTest(trimmed, shell, io);
+  },
+
+  mkdir(args, shell, io) {
+    let parents = false;
+    const targets = [];
+    for (const arg of args) {
+      if (arg === '-p') { parents = true; continue; }
+      if (arg.startsWith('-')) continue;
+      targets.push(arg);
+    }
+    let status = 0;
+    for (const target of targets) {
+      const tokens = shellResolve(shell, target);
+      const existing = shellLookup(shell, tokens);
+      if (existing) {
+        if (parents && isDir(existing)) continue;
+        io.stderr(`mkdir: can't create directory '${target}': File exists\n`);
+        status = 1;
+        continue;
+      }
+      if (parents) { shellEnsureDir(shell, target); continue; }
+      const resolved = shellParent(shell, target);
+      if (!resolved) { io.stderr(`mkdir: can't create directory '${target}': No such file or directory\n`); status = 1; continue; }
+      resolved.parent.children[resolved.name] = makeDir(resolved.name, {});
+    }
+    return status;
+  },
+
+  rmdir(args, shell, io) {
+    let status = 0;
+    for (const target of args.filter((a) => !a.startsWith('-'))) {
+      const resolved = shellParent(shell, target);
+      const node = resolved?.parent.children[resolved.name];
+      if (!node || !isDir(node)) { io.stderr(`rmdir: '${target}': No such file or directory\n`); status = 1; continue; }
+      if (Object.keys(node.children).length > 0) { io.stderr(`rmdir: '${target}': Directory not empty\n`); status = 1; continue; }
+      delete resolved.parent.children[resolved.name];
+    }
+    return status;
+  },
+
+  rm(args, shell, io) {
+    let recursive = false;
+    let force = false;
+    const targets = [];
+    for (const arg of args) {
+      if (arg === '--') continue;
+      if (arg.startsWith('-') && arg.length > 1) {
+        if (arg.includes('r') || arg.includes('R')) recursive = true;
+        if (arg.includes('f')) force = true;
+        continue;
+      }
+      targets.push(arg);
+    }
+    let status = 0;
+    for (const target of targets) {
+      const tokens = shellResolve(shell, target);
+      const node = shellLookup(shell, tokens);
+      if (!node) { if (!force) { io.stderr(`rm: can't remove '${target}': No such file or directory\n`); status = 1; } continue; }
+      if (isDir(node) && !recursive) { io.stderr(`rm: can't remove '${target}': Is a directory\n`); status = 1; continue; }
+      const resolved = shellParent(shell, target);
+      if (resolved) delete resolved.parent.children[resolved.name];
+    }
+    return status;
+  },
+
+  cp(args, shell, io) {
+    const targets = args.filter((a) => !a.startsWith('-'));
+    if (targets.length < 2) { io.stderr('cp: missing destination file operand\n'); return 1; }
+    const source = shellLookup(shell, shellResolve(shell, targets[0]));
+    if (!source) { io.stderr(`cp: cannot stat '${targets[0]}': No such file or directory\n`); return 1; }
+    const destinationNode = shellLookup(shell, shellResolve(shell, targets[1]));
+    if (destinationNode && isDir(destinationNode)) {
+      destinationNode.children[source.name] = cloneVfs(source);
+      return 0;
+    }
+    const resolved = shellParent(shell, targets[1]);
+    if (!resolved) { io.stderr(`cp: cannot create '${targets[1]}': No such file or directory\n`); return 1; }
+    resolved.parent.children[resolved.name] = cloneVfs(source);
+    return 0;
+  },
+
+  mv(args, shell, io) {
+    const targets = args.filter((a) => !a.startsWith('-'));
+    if (targets.length < 2) { io.stderr('mv: missing destination file operand\n'); return 1; }
+    const sourceTokens = shellResolve(shell, targets[0]);
+    const source = shellLookup(shell, sourceTokens);
+    if (!source) { io.stderr(`mv: cannot stat '${targets[0]}': No such file or directory\n`); return 1; }
+    const destinationNode = shellLookup(shell, shellResolve(shell, targets[1]));
+    if (destinationNode && isDir(destinationNode)) {
+      destinationNode.children[source.name] = source;
+    } else {
+      const resolved = shellParent(shell, targets[1]);
+      if (!resolved) { io.stderr(`mv: cannot move to '${targets[1]}'\n`); return 1; }
+      resolved.parent.children[resolved.name] = source;
+      source.name = resolved.name;
+    }
+    const parent = shellParent(shell, targets[0]);
+    if (parent && parent.parent.children[parent.name] === source) delete parent.parent.children[parent.name];
+    return 0;
+  },
+
+  cat(args, shell, io) {
+    const targets = args.filter((a) => !a.startsWith('-'));
+    if (targets.length === 0) { io.stdout(String(io.stdin ?? '')); return 0; }
+    let status = 0;
+    for (const target of targets) {
+      const content = shellReadFile(shell, target);
+      if (content === null) { io.stderr(`cat: ${target}: No such file or directory\n`); status = 1; continue; }
+      io.stdout(content.endsWith('\n') || content === '' ? content : content + '\n');
+    }
+    return status;
+  },
+
+  ls(args, shell, io) {
+    const long = args.some((a) => a.startsWith('-') && a.includes('l'));
+    const showAll = args.some((a) => a.startsWith('-') && a.includes('a'));
+    const targets = args.filter((a) => !a.startsWith('-'));
+    if (targets.length === 0) targets.push('.');
+    let status = 0;
+    for (const target of targets) {
+      const node = shellLookup(shell, shellResolve(shell, target));
+      if (!node) { io.stderr(`ls: ${target}: No such file or directory\n`); status = 1; continue; }
+      if (!isDir(node)) { io.stdout(node.name + '\n'); continue; }
+      let names = Object.keys(node.children).sort();
+      if (showAll) names = ['.', '..', ...names];
+      if (long) {
+        for (const name of names) {
+          const child = node.children[name];
+          const kind = !child ? 'd' : isDir(child) ? 'd' : '-';
+          const size = child && child.type === 'file' ? String(child.content.length).padStart(6) : '     0';
+          io.stdout(`${kind}rw-r--r-- 1 ubuntu ubuntu ${size} ${name}\n`);
+        }
+      } else {
+        io.stdout(names.join('  ') + '\n');
+      }
+    }
+    return status;
+  },
+
+  ln(args, shell, io) {
+    const targets = args.filter((a) => !a.startsWith('-'));
+    if (targets.length < 2) { io.stderr('ln: missing file operand\n'); return 1; }
+    const source = shellLookup(shell, shellResolve(shell, targets[0]));
+    if (!source) { io.stderr(`ln: failed to access '${targets[0]}'\n`); return 1; }
+    const resolved = shellParent(shell, targets[1]);
+    if (!resolved) { io.stderr(`ln: failed to create '${targets[1]}'\n`); return 1; }
+    resolved.parent.children[resolved.name] = makeFile(resolved.name, source.content ?? '', { link: targets[0] });
+    return 0;
+  },
+
+  chmod(args, shell, io) {
+    const targets = args.filter((a) => !/^[0-7]+$/.test(a));
+    const mode = args.find((a) => /^[0-7]{3,4}$/.test(a));
+    let status = 0;
+    for (const target of targets) {
+      const node = shellLookup(shell, shellResolve(shell, target));
+      if (!node) { io.stderr(`chmod: cannot access '${target}'\n`); status = 1; continue; }
+      if (mode) node.mode = mode;
+    }
+    return status;
+  },
+
+  chown(args, shell) { return 0; },
+  chgrp(args, shell) { return 0; },
+
+  touch(args, shell, io) {
+    let status = 0;
+    for (const target of args.filter((a) => !a.startsWith('-'))) {
+      const existing = shellLookup(shell, shellResolve(shell, target));
+      if (existing) { existing.touched = Date.now(); continue; }
+      try { shellWriteFile(shell, target, ''); }
+      catch { io.stderr(`touch: cannot touch '${target}': No such file or directory\n`); status = 1; }
+    }
+    return status;
+  },
+
+  head(args, shell, io) {
+    let count = 10;
+    const targets = [];
+    for (let index = 0; index < args.length; index++) {
+      if (args[index] === '-n') { count = Number(args[++index]); continue; }
+      if (/^-\d+$/.test(args[index])) { count = Number(args[index].slice(1)); continue; }
+      if (args[index].startsWith('-')) continue;
+      targets.push(args[index]);
+    }
+    const text = targets.length === 0 ? String(io.stdin ?? '') : targets.map((t) => shellReadFile(shell, t) ?? '').join('');
+    io.stdout(text.split('\n').slice(0, count).join('\n') + '\n');
+    return 0;
+  },
+
+  tail(args, shell, io) {
+    let count = 10;
+    const targets = [];
+    for (let index = 0; index < args.length; index++) {
+      if (args[index] === '-n') { count = Number(args[++index]); continue; }
+      if (/^-\d+$/.test(args[index])) { count = Number(args[index].slice(1)); continue; }
+      if (args[index].startsWith('-')) continue;
+      targets.push(args[index]);
+    }
+    const text = targets.length === 0 ? String(io.stdin ?? '') : targets.map((t) => shellReadFile(shell, t) ?? '').join('');
+    io.stdout(text.split('\n').slice(-count).join('\n') + '\n');
+    return 0;
+  },
+
+  grep(args, shell, io) {
+    let ignoreCase = false;
+    let invert = false;
+    const rest = [];
+    for (const arg of args) {
+      if (arg === '-i') { ignoreCase = true; continue; }
+      if (arg === '-v') { invert = true; continue; }
+      if (arg.startsWith('-') && arg.length > 1) continue;
+      rest.push(arg);
+    }
+    const pattern = rest.shift();
+    if (pattern === undefined) { io.stderr('grep: missing pattern\n'); return 2; }
+    const source = rest.length === 0 ? String(io.stdin ?? '') : rest.map((t) => shellReadFile(shell, t) ?? '').join('');
+    const expression = new RegExp(pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), ignoreCase ? 'i' : '');
+    const matched = source.split('\n').filter((line) => expression.test(line) !== invert);
+    if (matched.length > 0) io.stdout(matched.join('\n') + '\n');
+    return matched.length > 0 ? 0 : 1;
+  },
+
+  sed(args, shell, io) {
+    let expression = null;
+    const targets = [];
+    let index = 0;
+    for (; index < args.length; index++) {
+      if (args[index] === '-e') { expression = args[++index]; continue; }
+      if (args[index].startsWith('-')) continue;
+      if (expression === null) { expression = args[index]; continue; }
+      targets.push(args[index]);
+    }
+    if (!expression) return 0;
+    const match = /^s(.)(.*?)\1(.*?)\1([gi]*)$/.exec(expression);
+    if (!match) return 0;
+    const [, , from, to, flags] = match;
+    const source = targets.length === 0 ? String(io.stdin ?? '') : targets.map((t) => shellReadFile(shell, t) ?? '').join('');
+    const expression2 = new RegExp(from, flags.includes('g') ? 'g' : '');
+    const result = source.split('\n').map((line) => line.replace(expression2, to)).join('\n');
+    if (targets.length === 0) io.stdout(result);
+    else for (const target of targets) shellWriteFile(shell, target, result);
+    return 0;
+  },
+
+  tr(args, shell, io) {
+    const operands = args.filter((a) => !a.startsWith('-'));
+    const deleteMode = args.includes('-d');
+    const source = String(io.stdin ?? '');
+
+    // Expand ranges such as a-z, which is what scripts actually pass.
+    const expandSet = (spec) => {
+      const characters = [];
+      for (let index = 0; index < spec.length; index++) {
+        if (spec[index + 1] === '-' && spec[index + 2] !== undefined) {
+          const from = spec.charCodeAt(index);
+          const to = spec.charCodeAt(index + 2);
+          const step = from <= to ? 1 : -1;
+          for (let code = from; step > 0 ? code <= to : code >= to; code += step) characters.push(String.fromCharCode(code));
+          index += 2;
+          continue;
+        }
+        characters.push(spec[index]);
+      }
+      return characters;
+    };
+
+    if (deleteMode) {
+      const remove = new Set(expandSet(operands[0] ?? ''));
+      io.stdout([...source].filter((c) => !remove.has(c)).join(''));
+      return 0;
+    }
+
+    const from = expandSet(operands[0] ?? '');
+    const to = expandSet(operands[1] ?? '');
+    const map = new Map();
+    from.forEach((character, index) => map.set(character, to[index] ?? to[to.length - 1] ?? character));
+    io.stdout([...source].map((c) => map.get(c) ?? c).join(''));
+    return 0;
+  },
+
+  sort(args, shell, io) {
+    const source = args.filter((a) => !a.startsWith('-')).map((t) => shellReadFile(shell, t) ?? '').join('') || String(io.stdin ?? '');
+    const lines = source.split('\n').filter(Boolean).sort();
+    if (args.includes('-r')) lines.reverse();
+    io.stdout(lines.join('\n') + '\n');
+    return 0;
+  },
+
+  uniq(args, shell, io) {
+    const source = args.filter((a) => !a.startsWith('-')).map((t) => shellReadFile(shell, t) ?? '').join('') || String(io.stdin ?? '');
+    const lines = source.split('\n').filter((line, index, all) => line !== all[index - 1]);
+    io.stdout(lines.join('\n'));
+    return 0;
+  },
+
+  wc(args, shell, io) {
+    const targets = args.filter((a) => !a.startsWith('-'));
+    const source = targets.length ? targets.map((t) => shellReadFile(shell, t) ?? '').join('') : String(io.stdin ?? '');
+    const counts = {
+      lines: source.split('\n').length - (source.endsWith('\n') ? 1 : 0),
+      words: source.split(/\s+/).filter(Boolean).length,
+      chars: source.length
+    };
+    if (args.includes('-l')) io.stdout(`${counts.lines}\n`);
+    else if (args.includes('-w')) io.stdout(`${counts.words}\n`);
+    else if (args.includes('-c')) io.stdout(`${counts.chars}\n`);
+    else io.stdout(`${counts.lines} ${counts.words} ${counts.chars}\n`);
+    return 0;
+  },
+
+  basename(args, io) {
+    const target = String(args[0] ?? '').replace(/\/+$/, '');
+    io.stdout((target.split('/').pop() ?? '') + '\n');
+    return 0;
+  },
+
+  dirname(args, io) {
+    const parts = String(args[0] ?? '').split('/');
+    parts.pop();
+    io.stdout((parts.join('/') || '.') + '\n');
+    return 0;
+  },
+
+  id(args, shell, io) { io.stdout('uid=0(root) gid=0(root) groups=0(root)\n'); return 0; },
+  whoami(args, shell, io) { io.stdout('root\n'); return 0; },
+  hostname(args, shell, io) { io.stdout('sandbox-vm\n'); return 0; },
+  uname(args, shell, io) { io.stdout('Linux sandbox-vm 6.14.0-generic #1 SMP x86_64 GNU/Linux\n'); return 0; },
+  date(args, shell, io) { io.stdout(new Date().toString() + '\n'); return 0; },
+  sleep(args) { return 0; },
+  sync(args) { return 0; },
+  free(args, shell, io) { io.stdout('              total        used        free\nMem:        2048000      431104     1616896\n'); return 0; },
+  df(args, shell, io) { io.stdout('Filesystem     1K-blocks    Used Available Use% Mounted on\n/dev/vda1        8388608 3222528   5166080  38% /\n'); return 0; },
+
+  // Account management is a no-op here: there is no real user database, but a
+  // maintainer script that calls these must still succeed.
+  addgroup(args, shell, io) { return 0; },
+  adduser(args, shell, io) { return 0; },
+  delgroup(args, shell, io) { return 0; },
+  deluser(args, shell, io) { return 0; },
+  groupadd(args, shell, io) { return 0; },
+  useradd(args, shell, io) { return 0; },
+  usermod(args, shell, io) { return 0; },
+  passwd(args, shell, io) { return 0; },
+
+  exit(args, shell) { throw new ShellExit(Number(args[0] ?? shell.lastStatus) || 0); },
+  return(args, shell) { throw new ShellReturn(Number(args[0] ?? shell.lastStatus) || 0); },
+
+  source(args, shell, io) { return shellSourceBuiltin(args, shell, io); },
+  '.': (args, shell, io) => shellSourceBuiltin(args, shell, io),
+
+  eval(args, shell, io) {
+    const source = args.join(' ');
+    try { shell.run(source, io); } catch (error) { if (!(error instanceof ShellExit)) throw error; }
+    return shell.lastStatus;
+  },
+
+  command(args, shell, io) {
+    if (args.length === 0) return 0;
+    return shellRunCommand(args, shell, io);
+  },
+
+  env(args, shell, io) {
+    if (args.length === 0) {
+      for (const [key, value] of shell.vars) io.stdout(`${key}=${value}\n`);
+      return 0;
+    }
+    return shellRunCommand(args, shell, io);
+  },
+
+  seq(args, io) {
+    const numbers = args.map(Number);
+    let [start, step, end] = numbers.length === 1 ? [1, 1, numbers[0]]
+      : numbers.length === 2 ? [numbers[0], 1, numbers[1]]
+        : numbers;
+    if (step === 0) step = 1;
+    for (let value = start; step > 0 ? value <= end : value >= end; value += step) io.stdout(String(value) + '\n');
+    return 0;
+  },
+
+};
+
+/** Load a script from the VFS and run it in the current shell. */
+function shellSourceBuiltin(args, shell, io) {
+  const target = args[0];
+  if (!target) return 1;
+  const resolved = shellLookup(shell, shellResolve(shell, target));
+  if (!resolved) { io.stderr(`sh: ${target}: not found\n`); return 1; }
+  const source = resolved.type === 'file' ? resolved.content : '';
+  try { shell.run(source, io); } catch (error) { if (!(error instanceof ShellExit)) throw error; }
+  return shell.lastStatus;
+}
+
+/** Evaluate a test expression, used by test and [. */
+function shellTest(args, shell, io) {
+  // Handle the leading negation before anything else, because '!' is not an
+  // operand and would otherwise be compared as a string.
+  if (args[0] === '!') return shellTest(args.slice(1), shell, io) === 0 ? 1 : 0;
+  if (args.length === 0) return 1;
+
+  const unary = (operator, value) => {
+    switch (operator) {
+      case '-z': return value === '';
+      case '-n': return value !== '';
+      case '-e': return shellLookup(shell, shellResolve(shell, value)) !== null;
+      case '-f': return shellLookup(shell, shellResolve(shell, value))?.type === 'file';
+      case '-d': return isDir(shellLookup(shell, shellResolve(shell, value)));
+      case '-x': return true;
+      case '-r': case '-w': return true;
+      default: return false;
+    }
+  };
+  const binary = (left, operator, right) => {
+    switch (operator) {
+      case '=': case '==': return left === right;
+      case '!=': return left !== right;
+      case '-eq': return Number(left) === Number(right);
+      case '-ne': return Number(left) !== Number(right);
+      case '-lt': return Number(left) < Number(right);
+      case '-le': return Number(left) <= Number(right);
+      case '-gt': return Number(left) > Number(right);
+      case '-ge': return Number(left) >= Number(right);
+      default: return false;
+    }
+  };
+
+  if (args.length === 1) return args[0] !== '' ? 0 : 1;
+  if (args.length === 2) return unary(args[0], args[1]) ? 0 : 1;
+  if (args.length === 3) return binary(args[0], args[1], args[2]) ? 0 : 1;
+
+  const orIndex = args.indexOf('-o');
+  if (orIndex > 0) {
+    return shellTest(args.slice(0, orIndex), shell, io) === 0
+      || shellTest(args.slice(orIndex + 1), shell, io) === 0 ? 0 : 1;
+  }
+  const andIndex = args.indexOf('-a');
+  if (andIndex > 0) {
+    return shellTest(args.slice(0, andIndex), shell, io) === 0
+      && shellTest(args.slice(andIndex + 1), shell, io) === 0 ? 0 : 1;
+  }
+  return 1;
+}
+
+/* --- external commands ------------------------------------------------ */
+
+/**
+ * Busybox is a multi-call binary: one executable that behaves as whichever
+ * applet name it is invoked with. The package installs symlinks such as
+ * /bin/mkdir pointing at /bin/busybox.
+ *
+ * When a script runs busybox this way, and the applet is one this interpreter
+ * already implements, the call is dispatched to that builtin. The binary is
+ * still never executed, and applets without an implementation are reported.
+ */
+function shellRunBusybox(args, shell, io) {
+  let applet = null;
+  let rest = args;
+
+  if (args.length === 0) {
+    io.stdout('BusyBox v1.37.0 (Alpine) multi-call binary.\n');
+    return 0;
+  }
+  if (args[0] === '--install') {
+    // Creates the applet symlinks. The VFS already reaches the builtins by
+    // name, so there is nothing to link.
+    return 0;
+  }
+  if (args[0] === 'sh' || args[0] === 'ash') {
+    const scriptFile = args[1] === '-c' ? null : args[1];
+    if (args[1] === '-c') {
+      try { shell.run(args[2] ?? '', io); } catch (error) { if (!(error instanceof ShellExit)) throw error; }
+      return shell.lastStatus;
+    }
+    if (scriptFile) return shellSourceBuiltin([scriptFile, ...args.slice(2)], shell, io);
+    return 0;
+  }
+  if (args[0].startsWith('-')) applet = null;
+  else { applet = args[0]; rest = args.slice(1); }
+
+  if (applet && SHELL_BUILTINS[applet]) return SHELL_BUILTINS[applet](rest, shell, io);
+  if (applet) {
+    io.stderr(`busybox: applet '${applet}' is not implemented in this simulator\n`);
+    return 127;
+  }
+  return 0;
+}
+
+/** Recognise a path whose final segment is the busybox binary. */
+function isBusyboxPath(name) {
+  return /(^|\/)busybox$/.test(name) || /(^|\/)busybox[0-9.]*$/.test(name);
+}
+
+/**
+ * Commands that exist in a real Alpine system as ELF binaries. They are
+ * reported honestly rather than silently faked, because a browser cannot
+ * execute machine code.
+ */
+const NATIVE_BINARY_COMMANDS = new Set([
+  'apk', 'awk', 'bash', 'bunzip2', 'bzip2', 'curl', 'find', 'gzip', 'gunzip', 'tar',
+  'ssh', 'wget', 'perl', 'python3', 'python', 'node', 'nano', 'vi', 'vim', 'less',
+  'more', 'ps', 'top', 'kill', 'mount', 'umount', 'ifconfig', 'ip', 'netstat',
+  'ping', 'nslookup', 'dig', 'openssl', 'gcc', 'make', 'sqlite3', 'jq', 'git'
+]);
+
+/**
+ * Run a command that is not a builtin.
+ *
+ * The lookup order mirrors a real system: a matching script in the installed
+ * file system runs in the interpreter, busybox applets dispatch to builtins,
+ * a matching binary is reported as not runnable, and anything else is not found.
+ */
+function shellRunExternal(name, args, shell, io) {
+  if (isBusyboxPath(name)) return shellRunBusybox(args, shell, io);
+
+  const script = shellFindExecutable(shell, name);
+  if (script && script.type === 'file' && !script.binary && isShellScript(script.content)) {
+    return shellRunScriptFile(script, args, shell, io);
+  }
+
+  if (script && script.binary) {
+    io.stderr(
+      `${name}: this is a real Alpine binary and the package is installed, but the\n` +
+      `${' '.repeat(name.length)}  browser cannot execute native machine code.\n`
+    );
+    return 126;
+  }
+
+  if (NATIVE_BINARY_COMMANDS.has(name)) {
+    io.stderr(`sh: ${name}: command is provided by an Alpine package that is not installed\n`);
+    return 127;
+  }
+
+  io.stderr(`sh: ${name}: not found\n`);
+  return 127;
+}
+
+/** Does the text start with a shell shebang? */
+function isShellScript(content) {
+  return typeof content === 'string' && /^#!\s*\S*\/(?:ba|a|k|z)?sh\b/.test(content);
+}
+
+/** Search PATH-like directories in the VFS for an executable name. */
+function shellFindExecutable(shell, name) {
+  if (name.includes('/')) return shellLookup(shell, shellResolve(shell, name));
+  const searchPath = (shell.vars.get('PATH') ?? '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin')
+    .split(':');
+  for (const directory of searchPath) {
+    const tokens = normalizeSegments(directory.split('/'));
+    const node = shellLookup(shell, [...tokens, name]);
+    if (node) return node;
+  }
+  return null;
+}
+
+/** Run a script file with its arguments, in a child shell. */
+function shellRunScriptFile(node, args, shell, io) {
+  const child = new Shell({ cwd: shell.cwd, env: Object.fromEntries(shell.vars), fs: shell.fs });
+  child.functions = shell.functions;
+  child.vars.set('@', ['0', ...args].join('\u0001'));
+  child.vars.set('0', node.name);
+  const source = String(node.content).replace(/^#![^\n]*\n/, '');
+  try {
+    child.run(source, { stdin: io.stdin, stdout: io.stdout, stderr: io.stderr });
+  } catch (error) {
+    if (error instanceof ShellExit) return error.code;
+    if (error instanceof ShellReturn) return error.code;
+    io.stderr(`${node.name}: ${error?.message ?? error}\n`);
+    return 1;
+  }
+  return child.lastStatus;
+}
+
+/* --- Shell.run -------------------------------------------------------- */
+
+/**
+ * Tokenize, parse and execute a script. Throws ShellExit when the script
+ * calls exit.
+ */
+Shell.prototype.run = function run(source, io = {}) {
+  const clean = stripShellComments(source);
+  const tokens = shellTokenize(clean);
+  if (tokens.length === 0) return 0;
+  const ast = new ShellParser(tokens).parseList(tokens);
+  const streams = {
+    stdin: io.stdin ?? this.stdin,
+    stdout: io.stdout ?? ((text) => this.out(text)),
+    stderr: io.stderr ?? ((text) => this.err(text))
+  };
+  const status = shellExecNode(ast, this, streams);
+  this.lastStatus = status;
+  return status;
+};
+
+/**
+ * Drop full-line and trailing comments. Quoted '#' characters are preserved,
+ * which is what scripts actually rely on.
+ */
+function stripShellComments(source) {
+  return String(source).split('\n').map((line) => {
+    let quote = '';
+    for (let index = 0; index < line.length; index++) {
+      const character = line[index];
+      if (quote) { if (character === quote) quote = ''; continue; }
+      if (character === "'" || character === '"') { quote = character; continue; }
+      if (character === '#' && (index === 0 || /\s/.test(line[index - 1]))) {
+        return line.slice(0, index);
+      }
+    }
+    return line;
+  }).join('\n');
+}
+
+/* --- running maintainer scripts --------------------------------------- */
+
+/**
+ * Run one maintainer script from a package.
+ * Returns { status, output, errors, steps }.
+ *
+ * The script runs against the live VFS, so a script that creates directories
+ * or writes files has a real effect. Calls that would touch the host system
+ * are recorded and skipped.
+ */
+function runMaintainerScript(source, packageName) {
+  const shell = new Shell({
+    cwd: [],
+    env: {
+      PATH: '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+      HOME: '/root',
+      PWD: '/',
+      SHELL: '/bin/sh',
+      PKG: packageName
+    }
+  });
+  shell.fs = VFS;
+
+  const startTime = performance.now();
+  let status = 0;
+  let error = '';
+
+  try {
+    shell.run(source, {
+      stdin: '',
+      stdout: (text) => {},
+      stderr: (text) => { error += text; }
+    });
+    status = shell.lastStatus;
+  } catch (caught) {
+    if (caught instanceof ShellExit) status = caught.code;
+    else error += caught?.message ?? String(caught);
+  }
+
+  return {
+    status,
+    error: error.trim(),
+    output: shell.stdout.join('').trim(),
+    steps: shell.steps,
+    milliseconds: Math.round(performance.now() - startTime)
+  };
+}
+
+
+/* ---------------------------------------------------------------------
+   9. apk package manager
+   --------------------------------------------------------------------- */
+/* Real Alpine package handling, in the browser:
+
+     * gzip/deflate decoding, written here so the exact member boundary of a
+       multi-member gzip file can be found (the compressed bytes are what the
+       signature covers, so the boundary has to be byte exact).
+     * tar reader for the uncompressed segments.
+     * APKINDEX parser for the package database.
+     * RSA PKCS#1 v1.5 / SHA-1 signature verification against a pinned set of
+       Alpine release keys. Verification is what makes a third-party CORS
+       proxy safe to use: the transport may be untrusted, the signature is not.
+     * package download, checksum check and extraction into the VFS.
+
+   An .apk is a concatenation of three gzip members:
+
+     member 1  tar holding .SIGN.RSA.<keyname>
+     member 2  tar holding .PKGINFO and the maintainer scripts
+     member 3  tar holding the payload
+
+   The signature is RSA-SHA1 over member 2's compressed bytes. The index field
+   C: is "Q1" followed by the base64 SHA-1 of those same compressed bytes.
+   ------------------------------------------------------------------ */
+
+/** Standard base64 alphabet, no padding characters. */
+const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+
+function bytesToBase64(bytes) {
+  let out = '';
+  for (let i = 0; i < bytes.length; i += 3) {
+    const remaining = bytes.length - i;
+    const b0 = bytes[i];
+    const b1 = remaining > 1 ? bytes[i + 1] : 0;
+    const b2 = remaining > 2 ? bytes[i + 2] : 0;
+    out += B64[b0 >> 2];
+    out += B64[((b0 & 0x03) << 4) | (b1 >> 4)];
+    out += remaining > 1 ? B64[((b1 & 0x0f) << 2) | (b2 >> 6)] : '=';
+    out += remaining > 2 ? B64[b2 & 0x3f] : '=';
+  }
+  return out;
+}
+
+function base64ToBytes(text) {
+  const clean = String(text).replace(/[^A-Za-z0-9+/]/g, '');
+  const out = new Uint8Array(Math.floor((clean.length * 3) / 4));
+  let accumulator = 0;
+  let bits = 0;
+  let at = 0;
+  for (const character of clean) {
+    // Mask after every shift. JavaScript bitwise operators work on 32-bit
+    // integers, so an unmasked accumulator would silently wrap.
+    accumulator = ((accumulator << 6) | B64.indexOf(character)) & 0xffffff;
+    bits += 6;
+    while (bits >= 8) {
+      bits -= 8;
+      out[at++] = (accumulator >> bits) & 0xff;
+    }
+  }
+  return out.subarray(0, at);
+}
+
+function bytesToHex(bytes) {
+  let out = '';
+  for (const byte of bytes) out += byte.toString(16).padStart(2, '0');
+  return out;
+}
+
+async function sha1Of(bytes) {
+  if (globalThis.crypto?.subtle) {
+    const digest = await crypto.subtle.digest('SHA-1', bytes);
+    return new Uint8Array(digest);
+  }
+  return sha1Fallback(bytes);
+}
+
+/** SHA-1 for environments without WebCrypto (node test harness, older pages). */
+function sha1Fallback(bytes) {
+  const ml = bytes.length * 8;
+  const withPad = new Uint8Array((((bytes.length + 8) >> 6) + 1) * 64);
+  withPad.set(bytes);
+  withPad[bytes.length] = 0x80;
+  const view = new DataView(withPad.buffer);
+  view.setUint32(withPad.length - 8, Math.floor(ml / 0x100000000));
+  view.setUint32(withPad.length - 4, ml >>> 0);
+
+  let h0 = 0x67452301;
+  let h1 = 0xefcdab89;
+  let h2 = 0x98badcfe;
+  let h3 = 0x10325476;
+  let h4 = 0xc3d2e1f0;
+  const w = new Int32Array(80);
+  const rol = (v, n) => (v << n) | (v >>> (32 - n));
+
+  for (let block = 0; block < withPad.length; block += 64) {
+    for (let i = 0; i < 16; i++) w[i] = view.getInt32(block + i * 4);
+    for (let i = 16; i < 80; i++) w[i] = rol(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+
+    let a = h0;
+    let b = h1;
+    let c = h2;
+    let d = h3;
+    let e = h4;
+    for (let i = 0; i < 80; i++) {
+      let f;
+      let k;
+      if (i < 20) { f = (b & c) | (~b & d); k = 0x5a827999; }
+      else if (i < 40) { f = b ^ c ^ d; k = 0x6ed9eba1; }
+      else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8f1bbcdc; }
+      else { f = b ^ c ^ d; k = 0xca62c1d6; }
+      const temp = (rol(a, 5) + f + e + k + w[i]) | 0;
+      e = d;
+      d = c;
+      c = rol(b, 30);
+      b = a;
+      a = temp;
+    }
+    h0 = (h0 + a) | 0;
+    h1 = (h1 + b) | 0;
+    h2 = (h2 + c) | 0;
+    h3 = (h3 + d) | 0;
+    h4 = (h4 + e) | 0;
+  }
+
+  const out = new Uint8Array(20);
+  const outView = new DataView(out.buffer);
+  [h0, h1, h2, h3, h4].forEach((h, i) => outView.setUint32(i * 4, h >>> 0));
+  return out;
+}
+
+/* --- raw deflate (RFC 1951) ------------------------------------------ */
+
+const LENGTH_BASE = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
+const LENGTH_EXTRA = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
+const DIST_BASE = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577];
+const DIST_EXTRA = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
+const CODE_LENGTH_ORDER = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+
+/** Build a canonical Huffman decoding table from code lengths. */
+function buildHuffman(lengths) {
+  let maxBits = 0;
+  for (const length of lengths) if (length > maxBits) maxBits = length;
+  const counts = new Array(maxBits + 1).fill(0);
+  for (const length of lengths) if (length) counts[length]++;
+  const nextCode = new Array(maxBits + 2).fill(0);
+  let code = 0;
+  for (let bits = 1; bits <= maxBits; bits++) {
+    code = (code + counts[bits - 1]) << 1;
+    nextCode[bits] = code;
+  }
+  const table = new Map();
+  for (let symbol = 0; symbol < lengths.length; symbol++) {
+    const length = lengths[symbol];
+    if (!length) continue;
+    table.set(length * 65536 + nextCode[length], symbol);
+    nextCode[length]++;
+  }
+  return { maxBits, table };
+}
+
+/**
+ * Inflate a raw deflate stream beginning at `start`.
+ * Returns the decoded bytes and the offset just past the stream, which is what
+ * makes finding the gzip member boundary possible.
+ */
+function inflateRaw(bytes, start) {
+  let pos = start;
+  let bitBuffer = 0;
+  let bitCount = 0;
+  const out = [];
+
+  const nextByte = () => {
+    if (pos >= bytes.length) throw new Error('unexpected end of deflate stream');
+    return bytes[pos++];
+  };
+  const takeBits = (count) => {
+    while (bitCount < count) {
+      bitBuffer |= nextByte() << bitCount;
+      bitCount += 8;
+    }
+    const value = bitBuffer & ((1 << count) - 1);
+    bitBuffer >>>= count;
+    bitCount -= count;
+    return value;
+  };
+  const decode = (huffman) => {
+    let code = 0;
+    for (let length = 1; length <= huffman.maxBits; length++) {
+      code = (code << 1) | takeBits(1);
+      const symbol = huffman.table.get(length * 65536 + code);
+      if (symbol !== undefined) return symbol;
+    }
+    throw new Error('invalid Huffman code in deflate stream');
+  };
+
+  let last = 0;
+  do {
+    last = takeBits(1);
+    const type = takeBits(2);
+
+    if (type === 0) {
+      bitBuffer = 0;
+      bitCount = 0;
+      const length = nextByte() | (nextByte() << 8);
+      nextByte();
+      nextByte();
+      for (let i = 0; i < length; i++) out.push(nextByte());
+      continue;
+    }
+
+    if (type === 3) throw new Error('invalid deflate block type');
+
+    let literal;
+    let distance;
+    if (type === 1) {
+      const fixed = new Array(288);
+      for (let i = 0; i < 144; i++) fixed[i] = 8;
+      for (let i = 144; i < 256; i++) fixed[i] = 9;
+      for (let i = 256; i < 280; i++) fixed[i] = 7;
+      for (let i = 280; i < 288; i++) fixed[i] = 8;
+      literal = buildHuffman(fixed);
+      distance = buildHuffman(new Array(30).fill(5));
+    } else {
+      const literalCount = takeBits(5) + 257;
+      const distanceCount = takeBits(5) + 1;
+      const codeLengthCount = takeBits(4) + 4;
+      const codeLengths = new Array(19).fill(0);
+      for (let i = 0; i < codeLengthCount; i++) codeLengths[CODE_LENGTH_ORDER[i]] = takeBits(3);
+      const codeLengthTable = buildHuffman(codeLengths);
+
+      const lengths = [];
+      while (lengths.length < literalCount + distanceCount) {
+        const symbol = decode(codeLengthTable);
+        if (symbol < 16) {
+          lengths.push(symbol);
+        } else if (symbol === 16) {
+          const previous = lengths[lengths.length - 1];
+          const repeat = 3 + takeBits(2);
+          for (let i = 0; i < repeat; i++) lengths.push(previous);
+        } else if (symbol === 17) {
+          const repeat = 3 + takeBits(3);
+          for (let i = 0; i < repeat; i++) lengths.push(0);
+        } else {
+          const repeat = 11 + takeBits(7);
+          for (let i = 0; i < repeat; i++) lengths.push(0);
+        }
+      }
+      literal = buildHuffman(lengths.slice(0, literalCount));
+      distance = buildHuffman(lengths.slice(literalCount));
+    }
+
+    for (;;) {
+      const symbol = decode(literal);
+      if (symbol === 256) break;
+      if (symbol < 256) {
+        out.push(symbol);
+        continue;
+      }
+      const lengthIndex = symbol - 257;
+      const length = LENGTH_BASE[lengthIndex] + takeBits(LENGTH_EXTRA[lengthIndex]);
+      const distanceSymbol = decode(distance);
+      const back = DIST_BASE[distanceSymbol] + takeBits(DIST_EXTRA[distanceSymbol]);
+      const from = out.length - back;
+      if (from < 0) throw new Error('deflate stream referenced data before the start');
+      for (let i = 0; i < length; i++) out.push(out[from + i]);
+    }
+  } while (!last);
+
+  return { output: Uint8Array.from(out), end: pos };
+}
+
+/** Offset just past the gzip member that starts at `start`. */
+function gzipMemberEnd(bytes, start) {
+  if (bytes[start] !== 0x1f || bytes[start + 1] !== 0x8b) {
+    throw new Error(`no gzip member at offset ${start}`);
+  }
+  if (bytes[start + 2] !== 8) throw new Error('unsupported gzip compression method');
+  const flags = bytes[start + 3];
+  let pos = start + 10;
+  if (flags & 0x04) {
+    const extraLength = bytes[pos] | (bytes[pos + 1] << 8);
+    pos += 2 + extraLength;
+  }
+  if (flags & 0x08) { while (bytes[pos] !== 0) pos++; pos++; }
+  if (flags & 0x10) { while (bytes[pos] !== 0) pos++; pos++; }
+  if (flags & 0x02) pos += 2;
+  const { end } = inflateRaw(bytes, pos);
+  return end + 8;
+}
+
+/** Decompress a single-member gzip buffer. */
+function gunzip(bytes) {
+  const { output } = inflateRaw(bytes, gzipHeaderLength(bytes, 0));
+  return output;
+}
+
+function gzipHeaderLength(bytes, start) {
+  const flags = bytes[start + 3];
+  let pos = start + 10;
+  if (flags & 0x04) {
+    const extraLength = bytes[pos] | (bytes[pos + 1] << 8);
+    pos += 2 + extraLength;
+  }
+  if (flags & 0x08) { while (bytes[pos] !== 0) pos++; pos++; }
+  if (flags & 0x10) { while (bytes[pos] !== 0) pos++; pos++; }
+  if (flags & 0x02) pos += 2;
+  return pos;
+}
+
+/** Split a file into its gzip members, returning the compressed byte ranges. */
+function gzipMembers(bytes) {
+  const members = [];
+  let at = 0;
+  while (at < bytes.length && bytes[at] === 0x1f && bytes[at + 1] === 0x8b) {
+    const end = gzipMemberEnd(bytes, at);
+    members.push({ start: at, end, compressed: bytes.subarray(at, end) });
+    at = end;
+  }
+  return members;
+}
+
+/* --- tar -------------------------------------------------------------- */
+
+/**
+ * Read tar entries. Works on the decompressed bytes of one gzip member.
+ * Returns { name, size, data, attributes } for each regular file, in order.
+ *
+ * pax extended headers ('x') carry key = value metadata for the entry that
+ * follows. apk stores APK-TOOLS.checksum.SHA1 there, so the records are
+ * collected and attached to the next real entry rather than dropped.
+ */
+function parseTar(bytes) {
+  const entries = [];
+  const decoder = new TextDecoder();
+  let offset = 0;
+  let pending = null;
+
+  while (offset + 512 <= bytes.length) {
+    const header = bytes.subarray(offset, offset + 512);
+    if (header.every((byte) => byte === 0)) break;
+
+    const name = decoder.decode(header.subarray(0, 100)).replace(/\0.*$/, '');
+    const sizeField = decoder.decode(header.subarray(124, 136)).replace(/\0.*$/, '').trim();
+    const size = parseInt(sizeField, 8) || 0;
+    const typeFlag = String.fromCharCode(header[156] || 0x30);
+    const dataStart = offset + 512;
+    const data = bytes.subarray(dataStart, dataStart + size);
+    offset = dataStart + Math.ceil(size / 512) * 512;
+
+    if (typeFlag === 'x' || typeFlag === 'g') {
+      pending = parsePaxRecords(decoder.decode(data));
+      continue;
+    }
+    if (name && (typeFlag === '0' || typeFlag === '\0')) {
+      entries.push({ name: name.replace(/^\.\//, ''), size, data, typeFlag, attributes: pending ?? {} });
+    }
+    pending = null;
+  }
+  return entries;
+}
+
+/** Parse "LEN key=value\n" pax records into a plain object. */
+function parsePaxRecords(text) {
+  const records = {};
+  let at = 0;
+  while (at < text.length) {
+    const space = text.indexOf(' ', at);
+    if (space === -1) break;
+    const length = parseInt(text.slice(at, space), 10);
+    if (!Number.isFinite(length) || length <= 0) break;
+    const record = text.slice(space + 1, at + length).replace(/\n$/, '');
+    const equals = record.indexOf('=');
+    if (equals > 0) records[record.slice(0, equals)] = record.slice(equals + 1);
+    at += length;
+  }
+  return records;
+}
+
+/** Find a named entry in a tar listing. */
+function tarEntry(entries, name) {
+  const wanted = name.replace(/^\.\//, '');
+  return entries.find((entry) => entry.name === wanted)
+    ?? entries.find((entry) => entry.name.endsWith('/' + wanted))
+    ?? null;
+}
+
+/* --- APKINDEX --------------------------------------------------------- */
+
+/** Parse the APKINDEX record format into package objects. */
+function parseApkIndex(text) {
+  const packages = [];
+  for (const record of text.split('\n\n')) {
+    if (!record.trim()) continue;
+    const fields = new Map();
+    for (const line of record.split('\n')) {
+      if (line.length < 2 || line[1] !== ':') continue;
+      const key = line[0];
+      const value = line.slice(2);
+      fields.set(key, fields.has(key) ? `${fields.get(key)} ${value}` : value);
+    }
+    const name = fields.get('P');
+    const version = fields.get('V');
+    if (!name || !version) continue;
+    packages.push({
+      name,
+      version,
+      arch: fields.get('A') ?? '',
+      size: Number(fields.get('S') ?? 0),
+      installedSize: Number(fields.get('I') ?? 0),
+      description: fields.get('T') ?? '',
+      url: fields.get('U') ?? '',
+      license: fields.get('L') ?? '',
+      checksum: fields.get('C') ?? '',
+      origin: fields.get('o') ?? name,
+      maintainer: fields.get('m') ?? '',
+      depends: (fields.get('D') ?? '').split(' ').filter(Boolean),
+      provides: (fields.get('p') ?? '').split(' ').filter(Boolean),
+      installIf: fields.get('i') ?? '',
+      buildTime: Number(fields.get('t') ?? 0)
+    });
+  }
+  return packages;
+}
+
+/**
+ * Compare two apk version strings well enough for the -rN and letter suffix
+ * forms Alpine uses. Not a complete implementation of the apk version spec.
+ */
+function compareVersions(a, b) {
+  const split = (value) => {
+    const [base, revision] = String(value).split('-r');
+    const parts = [];
+    for (const chunk of base.split(/(\d+)/)) {
+      if (chunk === '') continue;
+      parts.push(/^\d+$/.test(chunk) ? Number(chunk) : chunk);
+    }
+    return { parts, revision: Number(revision ?? 0) };
+  };
+  const left = split(a);
+  const right = split(b);
+  const length = Math.max(left.parts.length, right.parts.length);
+  for (let i = 0; i < length; i++) {
+    const l = left.parts[i];
+    const r = right.parts[i];
+    if (l === undefined) return r === 0 ? 0 : -1;
+    if (r === undefined) return l === 0 ? 0 : 1;
+    if (typeof l === 'number' && typeof r === 'number') {
+      if (l !== r) return l < r ? -1 : 1;
+    } else {
+      const ls = String(l);
+      const rs = String(r);
+      if (ls !== rs) return ls < rs ? -1 : 1;
+    }
+  }
+  if (left.revision !== right.revision) return left.revision < right.revision ? -1 : 1;
+  return 0;
+}
+
+/* --- RSA verification ------------------------------------------------- */
+
+const SHA1_DIGEST_INFO = '3021300906052b0e03021a05000414';
+
+function pemToDer(pem) {
+  const body = String(pem).replace(/-----[A-Z ]+-----/g, '').replace(/\s+/g, '');
+  return base64ToBytes(body);
+}
+
+/** Pull the modulus and exponent out of a DER SubjectPublicKeyInfo blob. */
+function parseSpki(der) {
+  let at = 0;
+  const readTag = () => {
+    const tag = der[at++];
+    let length = der[at++];
+    if (length & 0x80) {
+      const count = length & 0x7f;
+      length = 0;
+      for (let i = 0; i < count; i++) length = (length << 8) | der[at++];
+    }
+    return { tag, length, start: at };
+  };
+  const toBigInt = (bytes) => {
+    let value = 0n;
+    for (const byte of bytes) value = (value << 8n) | BigInt(byte);
+    return value;
+  };
+
+  readTag(); // outer SEQUENCE
+  const algorithm = readTag();
+  at = algorithm.start + algorithm.length;
+  const bitString = readTag();
+  at = bitString.start + 1; // skip the unused-bits octet
+  const inner = readTag();
+  at = inner.start;
+  const modulusTag = readTag();
+  const modulus = toBigInt(der.subarray(modulusTag.start, modulusTag.start + modulusTag.length));
+  at = modulusTag.start + modulusTag.length;
+  const exponentTag = readTag();
+  const exponent = toBigInt(der.subarray(exponentTag.start, exponentTag.start + exponentTag.length));
+  return { modulus, exponent };
+}
+
+function modPow(base, exponent, modulus) {
+  let result = 1n;
+  let value = base % modulus;
+  let power = exponent;
+  while (power > 0n) {
+    if (power & 1n) result = (result * value) % modulus;
+    value = (value * value) % modulus;
+    power >>= 1n;
+  }
+  return result;
+}
+
+/**
+ * Verify an RSA PKCS#1 v1.5 signature with a SHA-1 digest, using BigInt maths.
+ *
+ * Written by hand on purpose. WebCrypto can compute a SHA-1 digest, but
+ * browsers have dropped RSASSA-PKCS1-v1_5 with SHA-1 for verify, which is
+ * exactly the scheme Alpine signs with.
+ */
+async function verifyRsaSha1(signature, payload, publicKeyPem) {
+  const { modulus, exponent } = parseSpki(pemToDer(publicKeyPem));
+  const keyLength = Math.ceil(modulus.toString(2).length / 8);
+  if (signature.length > keyLength) return false;
+
+  const digest = await sha1Of(payload);
+  const digestInfo = new Uint8Array(SHA1_DIGEST_INFO.length / 2 + digest.length);
+  for (let i = 0; i < SHA1_DIGEST_INFO.length / 2; i++) {
+    digestInfo[i] = parseInt(SHA1_DIGEST_INFO.substr(i * 2, 2), 16);
+  }
+  digestInfo.set(digest, SHA1_DIGEST_INFO.length / 2);
+
+  // Expected block: 0x00 0x01 0xFF.. 0x00 || DigestInfo
+  const expected = new Uint8Array(keyLength).fill(0xff);
+  expected[0] = 0x00;
+  expected[1] = 0x01;
+  const paddingLength = keyLength - 3 - digestInfo.length;
+  if (paddingLength < 8) return false;
+  expected[2 + paddingLength] = 0x00;
+  expected.set(digestInfo, 3 + paddingLength);
+
+  let signatureValue = 0n;
+  for (const byte of signature) signatureValue = (signatureValue << 8n) | BigInt(byte);
+  const recovered = modPow(signatureValue, exponent, modulus);
+
+  let hex = recovered.toString(16);
+  if (hex.length % 2) hex = '0' + hex;
+  hex = hex.padStart(keyLength * 2, '0');
+  const recoveredBytes = new Uint8Array(keyLength);
+  for (let i = 0; i < keyLength; i++) recoveredBytes[i] = parseInt(hex.substr(i * 2, 2), 16);
+
+  if (recoveredBytes.length !== expected.length) return false;
+  let difference = 0;
+  for (let i = 0; i < expected.length; i++) difference |= recoveredBytes[i] ^ expected[i];
+  return difference === 0;
+}
+
+/**
+ * Alpine release keys, copied from the alpine-keys package (etc/apk/keys).
+ * These are the trust anchors for every index and package check.
+ */
+const ALPINE_KEYS = {
+  'alpine-devel@lists.alpinelinux.org-6165ee59.rsa.pub': `-----BEGIN PUBLIC KEY-----
+MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAutQkua2CAig4VFSJ7v54
+ALyu/J1WB3oni7qwCZD3veURw7HxpNAj9hR+S5N/pNeZgubQvJWyaPuQDm7PTs1+
+tFGiYNfAsiibX6Rv0wci3M+z2XEVAeR9Vzg6v4qoofDyoTbovn2LztaNEjTkB+oK
+tlvpNhg1zhou0jDVYFniEXvzjckxswHVb8cT0OMTKHALyLPrPOJzVtM9C1ew2Nnc
+3848xLiApMu3NBk0JqfcS3Bo5Y2b1FRVBvdt+2gFoKZix1MnZdAEZ8xQzL/a0YS5
+Hd0wj5+EEKHfOd3A75uPa/WQmA+o0cBFfrzm69QDcSJSwGpzWrD1ScH3AK8nWvoj
+v7e9gukK/9yl1b4fQQ00vttwJPSgm9EnfPHLAtgXkRloI27H6/PuLoNvSAMQwuCD
+hQRlyGLPBETKkHeodfLoULjhDi1K2gKJTMhtbnUcAA7nEphkMhPWkBpgFdrH+5z4
+Lxy+3ek0cqcI7K68EtrffU8jtUj9LFTUC8dERaIBs7NgQ/LfDbDfGh9g6qVj1hZl
+k9aaIPTm/xsi8v3u+0qaq7KzIBc9s59JOoA8TlpOaYdVgSQhHHLBaahOuAigH+VI
+isbC9vmqsThF2QdDtQt37keuqoda2E6sL7PUvIyVXDRfwX7uMDjlzTxHTymvq2Ck
+htBqojBnThmjJQFgZXocHG8CAwEAAQ==
+-----END PUBLIC KEY-----`,
+  'alpine-devel@lists.alpinelinux.org-61666e3f.rsa.pub': `-----BEGIN PUBLIC KEY-----
+MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAlEyxkHggKCXC2Wf5Mzx4
+nZLFZvU2bgcA3exfNPO/g1YunKfQY+Jg4fr6tJUUTZ3XZUrhmLNWvpvSwDS19ZmC
+IXOu0+V94aNgnhMsk9rr59I8qcbsQGIBoHzuAl8NzZCgdbEXkiY90w1skUw8J57z
+qCsMBydAueMXuWqF5nGtYbi5vHwK42PffpiZ7G5Kjwn8nYMW5IZdL6ZnMEVJUWC9
+I4waeKg0yskczYDmZUEAtrn3laX9677ToCpiKrvmZYjlGl0BaGp3cxggP2xaDbUq
+qfFxWNgvUAb3pXD09JM6Mt6HSIJaFc9vQbrKB9KT515y763j5CC2KUsilszKi3mB
+HYe5PoebdjS7D1Oh+tRqfegU2IImzSwW3iwA7PJvefFuc/kNIijfS/gH/cAqAK6z
+bhdOtE/zc7TtqW2Wn5Y03jIZdtm12CxSxwgtCF1NPyEWyIxAQUX9ACb3M0FAZ61n
+fpPrvwTaIIxxZ01L3IzPLpbc44x/DhJIEU+iDt6IMTrHOphD9MCG4631eIdB0H1b
+6zbNX1CXTsafqHRFV9XmYYIeOMggmd90s3xIbEujA6HKNP/gwzO6CDJ+nHFDEqoF
+SkxRdTkEqjTjVKieURW7Swv7zpfu5PrsrrkyGnsRrBJJzXlm2FOOxnbI2iSL1B5F
+rO5kbUxFeZUIDq+7Yv4kLWcCAwEAAQ==
+-----END PUBLIC KEY-----`,
+};
+
+/** Read the signer key name out of a ".SIGN.RSA.<keyname>" entry name. */
+function signerNameFromEntry(name) {
+  const base = name.replace(/^\.\//, '').split('/').pop();
+  const prefix = '.SIGN.RSA.';
+  return base.startsWith(prefix) ? base.slice(prefix.length) : null;
+}
+
+/* --- repository state ------------------------------------------------- */
+
+const APK_DEFAULT_REPO = 'https://dl-cdn.alpinelinux.org/alpine';
+
+const apkState = {
+  repo: APK_DEFAULT_REPO,
+  branch: 'latest-stable',
+  section: 'main',
+  arch: 'x86_64',
+  proxy: '',
+  index: [],
+  indexMap: new Map(),
+  indexVerified: false,
+  indexSigner: '',
+  updatedAt: 0,
+  lastError: ''
+};
+
+/**
+ * Full URL for a repository path, honouring the configured proxy.
+ * Alpine lays repositories out as <base>/<branch>/<section>/<arch>/.
+ */
+function apkUrl(path) {
+  const base = `${apkState.repo.replace(/\/+$/, '')}/${apkState.branch}/${apkState.section}/${apkState.arch}`;
+  const url = `${base}/${path.replace(/^\/+/, '')}`;
+  if (!apkState.proxy) return url;
+  if (apkState.proxy.includes('%s')) return apkState.proxy.replace('%s', encodeURIComponent(url));
+  return apkState.proxy.replace(/\/+$/, '') + '/' + url;
+}
+
+function apkDisplayUrl(path) {
+  return `${apkState.repo}/${apkState.branch}/${apkState.section}/${apkState.arch}/${path}`;
+}
+
+/** Fetch bytes from the repository, reporting network and CORS failures plainly. */
+async function fetchRepoBytes(path) {
+  const url = apkUrl(path);
+  let response;
+  try {
+    response = await fetch(url, { redirect: 'follow', cache: 'no-store' });
+  } catch (error) {
+    const reason = error?.message ?? String(error);
+    throw new ShellError(
+      `apk: cannot reach the repository.\n` +
+      `  url:   ${url}\n` +
+      `  error: ${reason}\n` +
+      `A plain fetch fails when the host sends no Access-Control-Allow-Origin header.\n` +
+      `Set a CORS proxy with:  apk proxy <url>   (use %s where the target url goes)`
+    );
+  }
+  if (!response.ok) {
+    throw new ShellError(`apk: ${apkDisplayUrl(path)} returned HTTP ${response.status}`);
+  }
+  return new Uint8Array(await response.arrayBuffer());
+}
+
+/** Split an .apk (or APKINDEX.tar.gz) into its three gzip members. */
+function splitApkMembers(bytes) {
+  const members = gzipMembers(bytes);
+  if (members.length < 3) {
+    throw new Error(`expected 3 gzip members, found ${members.length}`);
+  }
+  return {
+    signature: members[0],
+    control: members[1],
+    payload: members[2]
+  };
+}
+
+/**
+ * Verify that `compressed` was signed by a pinned Alpine key.
+ * Returns the signer key name, or throws when nothing matches.
+ */
+async function verifySignedBlob(signatureTarBytes, compressed, label) {
+  const entries = parseTar(signatureTarBytes);
+  const signEntry = entries.find((entry) => entry.name.includes('.SIGN.'));
+  if (!signEntry) throw new Error(`${label}: no signature entry found`);
+
+  const keyName = signerNameFromEntry(signEntry.name);
+  const publicKey = ALPINE_KEYS[keyName];
+  if (!publicKey) throw new Error(`${label}: signature names an unknown key '${keyName}'`);
+
+  const valid = await verifyRsaSha1(signEntry.data, compressed, publicKey);
+  if (!valid) throw new Error(`${label}: signature does not match the pinned key`);
+  return keyName;
+}
+
+/* --- index refresh ---------------------------------------------------- */
+
+/** Download, verify and parse the repository index. */
+async function apkUpdate({ quiet = false } = {}) {
+  const say = (line) => { if (!quiet) writeLine(line); };
+  say(`fetch ${escapeHtml(apkDisplayUrl('APKINDEX.tar.gz'))}`);
+  const bytes = await fetchRepoBytes('APKINDEX.tar.gz');
+
+  const members = gzipMembers(bytes);
+  if (members.length < 2) throw new ShellError('apk: the index is not a gzip archive');
+
+  const signatureTar = gunzip(members[0].compressed);
+  const signer = await verifySignedBlob(signatureTar, members[1].compressed, 'index');
+  say(`signature ok, signed by <span class="t-ok">${escapeHtml(signer)}</span>`);
+
+  const indexText = new TextDecoder('utf-8').decode(gunzip(members[1].compressed));
+  const packages = parseApkIndex(indexText);
+
+  apkState.index = packages;
+  apkState.indexMap = new Map();
+  for (const entry of packages) {
+    const current = apkState.indexMap.get(entry.name);
+    if (!current || compareVersions(current.version, entry.version) < 0) {
+      apkState.indexMap.set(entry.name, entry);
+    }
+  }
+  apkState.indexVerified = true;
+  apkState.indexSigner = signer;
+  apkState.updatedAt = Date.now();
+  apkState.lastError = '';
+  say(`${packages.length} packages indexed, ${apkState.indexMap.size} distinct names`);
+  return packages;
+}
+
+/** Refresh the index when it is missing. */
+async function ensureIndex() {
+  if (apkState.indexVerified) return apkState.index;
+  return apkUpdate();
+}
+
+function findPackage(name) {
+  return apkState.indexMap.get(name) ?? null;
+}
+
+/** Search by name, description or provided command. */
+function searchPackages(term) {
+  const needle = term.toLowerCase();
+  const hits = [];
+  for (const entry of apkState.indexMap.values()) {
+    const haystack = `${entry.name} ${entry.description} ${entry.provides.join(' ')}`.toLowerCase();
+    if (haystack.includes(needle)) hits.push(entry);
+  }
+  hits.sort((a, b) => {
+    const aRank = a.name === needle ? 0 : a.name.startsWith(needle) ? 1 : 2;
+    const bRank = b.name === needle ? 0 : b.name.startsWith(needle) ? 1 : 2;
+    if (aRank !== bRank) return aRank - bRank;
+    return a.name.localeCompare(b.name);
+  });
+  return hits;
+}
+
+/* --- install ---------------------------------------------------------- */
+
+/** Turn a dependency string such as "so:libc.musl-x86_64.so.1" into a note. */
+function describeDependency(dependency) {
+  if (dependency.startsWith('so:')) return { kind: 'shared library', name: dependency.slice(3) };
+  if (dependency.startsWith('cmd:')) return { kind: 'command', name: dependency.slice(4).split('=')[0] };
+  const [name, constraint] = dependency.split(/[<>=~]/);
+  return { kind: 'package', name, constraint: constraint ?? '' };
+}
+
+/**
+ * Verify every payload file against the SHA-1 that apk records in its pax
+ * header. This is the same per-file check the apk client performs, and it
+ * catches corruption the package-level signature cannot see.
+ */
+async function verifyPayloadChecksums(entries) {
+  let checked = 0;
+  const failures = [];
+  for (const entry of entries) {
+    const expected = entry.attributes?.['APK-TOOLS.checksum.SHA1'];
+    if (!expected) continue;
+    checked++;
+    const actual = bytesToHex(await sha1Of(entry.data));
+    if (actual !== String(expected).toLowerCase()) failures.push(entry.name);
+  }
+  return { checked, failures };
+}
+
+/** Write one extracted payload file into the VFS. */
+function installPayloadFile(vfs, entry) {
+  const clean = entry.name.replace(/^\.\//, '');
+  if (clean.startsWith('.') || clean.endsWith('/')) return null;
+  const segments = clean.split('/').filter(Boolean);
+  const fileName = segments.pop();
+  if (!fileName) return null;
+
+  let node = vfs;
+  for (const segment of segments) {
+    if (!isDir(node.children[segment])) node.children[segment] = makeDir(segment, {});
+    node = node.children[segment];
+  }
+
+  if (entry.size < 65536 && !looksBinary(entry.data)) {
+    node.children[fileName] = makeFile(fileName, new TextDecoder('utf-8').decode(entry.data), { mode: 'rw-r--r--', from: 'apk' });
+  } else {
+    node.children[fileName] = makeFile(
+      fileName,
+      `[binary payload, ${entry.size} bytes]\n`,
+      { mode: 'rwxr-xr-x', binary: true, size: entry.size, from: 'apk' }
+    );
+  }
+  return clean;
+}
+
+/** A NUL byte or a high ratio of control bytes means the payload is binary. */
+function looksBinary(bytes) {
+  const sample = bytes.subarray(0, 4096);
+  let control = 0;
+  for (const byte of sample) {
+    if (byte === 0) return true;
+    if (byte < 9 || (byte > 13 && byte < 32)) control++;
+  }
+  return sample.length > 0 && control / sample.length > 0.1;
+}
+
+/** Read .PKGINFO key = value pairs from the control tar. */
+function parsePkgInfo(text) {
+  const info = { depends: [], provides: [], replaces: [], triggers: [] };
+  for (const line of text.split('\n')) {
+    const match = /^(\w+)\s*=\s*(.*)$/.exec(line.trim());
+    if (!match) continue;
+    const [, key, value] = match;
+    if (key === 'depend') info.depends.push(value.trim());
+    else if (key === 'provides') info.provides.push(value.trim());
+    else if (key === 'replaces') info.replaces.push(value.trim());
+    else if (key === 'triggers') info.triggers.push(value.trim());
+    else info[key] = value.trim();
+  }
+  return info;
+}
+
+function formatBytes(value) {
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KiB`;
+  return `${(value / 1024 / 1024).toFixed(1)} MiB`;
+}
+
+function countElfBinaries(entries) {
+  let count = 0;
+  for (const entry of entries) {
+    if (entry.size >= 1024 && entry.data[0] === 0x7f && entry.data[1] === 0x45 && entry.data[2] === 0x4c) count++;
+  }
+  return count;
+}
+
+/**
+ * Download one package, check it against the verified index, extract it into
+ * the VFS and run its maintainer scripts.
+ */
+async function apkInstall(name, { runScripts = true } = {}) {
+  const entry = findPackage(name);
+  if (!entry) throw new ShellError(`apk: no such package '${name}' in the index`);
+
+  writeLine(`fetch ${escapeHtml(`${entry.name}-${entry.version}.apk`)} (${formatBytes(entry.size)})`);
+  const bytes = await fetchRepoBytes(`${entry.name}-${entry.version}.apk`);
+
+  const members = splitApkMembers(bytes);
+
+  const signer = await verifySignedBlob(gunzip(members.signature.compressed), members.control.compressed, entry.name);
+  const checksum = 'Q1' + bytesToBase64(await sha1Of(members.control.compressed));
+  if (entry.checksum && checksum !== entry.checksum) {
+    throw new ShellError(
+      `apk: ${entry.name} failed the index checksum check\n  index:    ${entry.checksum}\n  download: ${checksum}`
+    );
+  }
+  writeLine(`  signature <span class="t-ok">ok</span> (${escapeHtml(signer)})  checksum <span class="t-ok">ok</span>`);
+
+  const controlEntries = parseTar(gunzip(members.control.compressed));
+  const pkgInfoEntry = tarEntry(controlEntries, '.PKGINFO');
+  const info = pkgInfoEntry ? parsePkgInfo(new TextDecoder('utf-8').decode(pkgInfoEntry.data)) : { depends: [] };
+
+  const payloadEntries = parseTar(gunzip(members.payload.compressed));
+
+  const integrity = await verifyPayloadChecksums(payloadEntries);
+  if (integrity.failures.length > 0) {
+    throw new ShellError(
+      `apk: ${entry.name} has ${integrity.failures.length} files with a bad checksum\n  ` +
+      integrity.failures.slice(0, 5).join('\n  ')
+    );
+  }
+  if (integrity.checked > 0) {
+    writeLine(`  ${integrity.checked} file checksums <span class="t-ok">ok</span>`);
+  }
+
+  const installed = [];
+  for (const payload of payloadEntries) {
+    const written = installPayloadFile(VFS, payload);
+    if (written) installed.push(written);
+  }
+
+  const elfCount = countElfBinaries(payloadEntries);
+  writeLine(`  ${installed.length} files written into the file system`);
+
+  const scripts = [];
+  if (runScripts) {
+    for (const script of controlEntries) {
+      if (!/\.(pre|post)-(install|upgrade|deinstall)$/.test(script.name)) continue;
+      scripts.push({ name: script.name.replace(/^\./, ''), body: new TextDecoder('utf-8').decode(script.data) });
+    }
+  }
+
+  return { entry, info, installed, scripts, elfCount };
+}
+
+/* --- installed package registry --------------------------------------- */
+
+apkState.installed = new Map();
+
+/* --- apk command line ------------------------------------------------- */
+
+const APK_USAGE = {
+  update: 'apk update',
+  add: 'apk add <package> [package...]',
+  del: 'apk del <package>',
+  search: 'apk search <term>',
+  info: 'apk info <package>',
+  list: 'apk list',
+  repo: 'apk repo [url]',
+  branch: 'apk branch [name] [section]',
+  proxy: 'apk proxy [url]',
+  status: 'apk status',
+  run: 'apk run <script> [argument...]'
+};
+
+const APK_DESCRIPTIONS = {
+  update: 'download and verify the repository index',
+  add: 'download, verify and install a package',
+  del: 'uninstall a package',
+  search: 'search the index by name or description',
+  info: 'show details for one package',
+  list: 'list installed packages',
+  repo: 'show or set the repository base url',
+  branch: 'show or set the branch and section',
+  proxy: 'show or set the CORS proxy',
+  status: 'show repository and proxy state',
+  run: 'run a script that an installed package provided'
+};
+
+/** Write one line of shell output to the terminal, preserving blank lines. */
+function shellEmitLine(text) {
+  const value = String(text).replace(/\n$/, '');
+  for (const line of value.split('\n')) writeLine(escapeHtml(line));
+}
+
+/**
+ * Run a shell script from the VFS, streaming its output to the terminal.
+ * Returns the exit status.
+ */
+async function runShellScript(path, args = [], { quiet = false } = {}) {
+  const shell = new Shell({ cwd: state.cwd, env: { PATH: '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', HOME: '/root' } });
+  shell.fs = VFS;
+  shell.vars.set('@', ['0', ...args].join('\u0001'));
+
+  const node = shellLookup(shell, shellResolve(shell, path));
+  if (!node) throw new ShellError(`run: ${path}: No such file or directory`);
+  if (node.type === 'dir') throw new ShellError(`run: ${path}: Is a directory`);
+
+  const source = String(node.content ?? '').replace(/^#![^\n]*\n/, '');
+  let status = 0;
+  const started = performance.now();
+
+  try {
+    shell.run(source, {
+      stdin: '',
+      stdout: (text) => { if (!quiet) shellEmitLine(text); },
+      stderr: (text) => { shellEmitLine(text); }
+    });
+    status = shell.lastStatus;
+  } catch (error) {
+    if (error instanceof ShellExit) status = error.code;
+    else throw error;
+  }
+
+  if (!quiet) {
+    writeLine(`<span class="t-dim">[sh] exit ${status} in ${Math.round(performance.now() - started)} ms, ${shell.steps} statements</span>`);
+  }
+  return status;
+}
+
+/** Handle the apk command family. */
+async function handleApkCommand(tokens) {
+  const sub = (tokens[1] ?? 'status').toLowerCase();
+  const rest = tokens.slice(2).filter((token) => token !== '');
+
+  if (sub === 'help' || sub === '--help' || sub === '-h') { printApkHelp(); return; }
+
+  if (sub === 'status') {
+    writeLine(`repository:  <span class="t-dir">${escapeHtml(apkState.repo)}</span>`);
+    writeLine(`branch:      ${escapeHtml(apkState.branch)}  section: ${escapeHtml(apkState.section)}  arch: ${escapeHtml(apkState.arch)}`);
+    writeLine(`proxy:       ${apkState.proxy ? `<span class="t-dir">${escapeHtml(apkState.proxy)}</span>` : 'none'}`);
+    writeLine(`index:       ${apkState.indexVerified
+      ? `<span class="t-ok">verified</span>, ${apkState.indexMap.size} packages, signed by ${escapeHtml(apkState.indexSigner)}`
+      : 'not downloaded yet. Run:  apk update'}`);
+    writeLine(`installed:   ${apkState.installed.size} packages`);
+    if (apkState.lastError) writeLine(`last error:  ${escapeHtml(apkState.lastError)}`, 't-warn');
+    return;
+  }
+
+  if (sub === 'repo') {
+    if (rest.length === 0) { writeLine(`repository: ${escapeHtml(apkState.repo)}`); return; }
+    apkState.repo = rest[0].replace(/\/+$/, '');
+    apkState.indexVerified = false;
+    apkState.updatedAt = 0;
+    writeLine(`repository set to ${escapeHtml(apkState.repo)}. Run:  apk update`, 't-ok');
+    return;
+  }
+
+  if (sub === 'branch') {
+    if (rest.length === 0) { writeLine(`branch: ${escapeHtml(apkState.branch)}  section: ${escapeHtml(apkState.section)}`); return; }
+    apkState.branch = rest[0];
+    if (rest[1]) apkState.section = rest[1];
+    apkState.indexVerified = false;
+    apkState.updatedAt = 0;
+    writeLine(`branch set to ${escapeHtml(apkState.branch)}/${escapeHtml(apkState.section)}. Run:  apk update`, 't-ok');
+    return;
+  }
+
+  if (sub === 'proxy') {
+    if (rest.length === 0) {
+      writeLine(`proxy: ${apkState.proxy ? escapeHtml(apkState.proxy) : 'none'}`);
+      writeLine('Set one with:  apk proxy https://example.com/?url=%s');
+      writeLine('Use %s where the target url goes. Without it the url is appended.');
+      return;
+    }
+    if (rest[0] === 'none' || rest[0] === 'off') {
+      apkState.proxy = '';
+      writeLine('proxy cleared.', 't-ok');
+      return;
+    }
+    apkState.proxy = rest[0];
+    writeLine(`proxy set to ${escapeHtml(apkState.proxy)}`, 't-ok');
+    return;
+  }
+
+  if (sub === 'update' || sub === 'upgrade') {
+    try {
+      const packages = await apkUpdate();
+      writeLine(`index ready: <span class="t-ok">${packages.length} packages</span>`, 't-ok');
+    } catch (error) {
+      apkState.lastError = error.message;
+      writeBlock(error.message, 'block--error');
+    }
+    return;
+  }
+
+  if (sub === 'search') {
+    if (rest.length === 0) { writeLine('apk search: missing search term', 't-err'); return; }
+    await withIndex(async () => {
+      const hits = searchPackages(rest.join(' '));
+      if (hits.length === 0) { writeLine(`no package matches '${escapeHtml(rest.join(' '))}'`); return; }
+      for (const entry of hits.slice(0, 40)) {
+        writeLine(`<span class="t-dir">${escapeHtml(entry.name)}</span>-${escapeHtml(entry.version)}  ${escapeHtml(formatBytes(entry.size))}  ${escapeHtml(entry.description)}`);
+      }
+      if (hits.length > 40) writeLine(`... and ${hits.length - 40} more`);
+    });
+    return;
+  }
+
+  if (sub === 'info') {
+    if (rest.length === 0) { writeLine('apk info: missing package name', 't-err'); return; }
+    await withIndex(async () => {
+      const entry = findPackage(rest[0]);
+      if (!entry) { writeLine(`apk: no such package '${escapeHtml(rest[0])}'`, 't-err'); return; }
+      writeLine(`<span class="t-ok">${escapeHtml(entry.name)}</span>-${escapeHtml(entry.version)}`);
+      writeLine(`  description: ${escapeHtml(entry.description)}`);
+      writeLine(`  url:         ${escapeHtml(entry.url)}`);
+      writeLine(`  license:     ${escapeHtml(entry.license)}`);
+      writeLine(`  origin:      ${escapeHtml(entry.origin)}`);
+      writeLine(`  maintainer:  ${escapeHtml(entry.maintainer)}`);
+      writeLine(`  size:        ${escapeHtml(formatBytes(entry.size))} download, ${escapeHtml(formatBytes(entry.installedSize))} installed`);
+      writeLine(`  checksum:    ${escapeHtml(entry.checksum)}`);
+      if (entry.depends.length) writeLine(`  depends:     ${escapeHtml(entry.depends.join(' '))}`);
+      if (entry.provides.length) writeLine(`  provides:    ${escapeHtml(entry.provides.join(' '))}`);
+    });
+    return;
+  }
+
+  if (sub === 'list') {
+    if (apkState.installed.size === 0) { writeLine('no packages installed. Try:  apk add alpine-conf'); return; }
+    for (const [name, record] of apkState.installed) {
+      writeLine(`<span class="t-dir">${escapeHtml(name)}</span>-${escapeHtml(record.version)}  ${record.files} files`);
+    }
+    return;
+  }
+
+  if (sub === 'del' || sub === 'remove') {
+    if (rest.length === 0) { writeLine('apk del: missing package name', 't-err'); return; }
+    for (const name of rest) {
+      if (!apkState.installed.has(name)) { writeLine(`apk: '${escapeHtml(name)}' is not installed`, 't-warn'); continue; }
+      apkState.installed.delete(name);
+      writeLine(`removed ${escapeHtml(name)} from the package database. Files stay in the file system.`, 't-ok');
+    }
+    return;
+  }
+
+  if (sub === 'run') {
+    if (rest.length === 0) { writeLine('apk run: missing script path', 't-err'); return; }
+    try { await runShellScript(rest[0], rest.slice(1)); }
+    catch (error) { writeBlock(error.message, 'block--error'); }
+    return;
+  }
+
+  if (sub === 'add' || sub === 'install') {
+    const names = rest.filter((token) => !token.startsWith('-'));
+    const runScripts = !rest.includes('--no-scripts');
+    if (names.length === 0) { writeLine('apk add: missing package name', 't-err'); return; }
+
+    await withIndex(async () => {
+      for (const name of names) {
+        const entry = findPackage(name);
+        if (!entry) { writeLine(`apk: no such package '${escapeHtml(name)}'`, 't-err'); continue; }
+        try {
+          const report = await apkInstall(name, { runScripts });
+
+          if (report.elfCount > 0) {
+            writeLine(`  ${report.elfCount} native binaries present, not executable in a browser`);
+          }
+
+          for (const script of report.scripts) {
+            const result = runMaintainerScript(script.body, name);
+            const label = result.status === 0 ? 't-ok' : 't-warn';
+            writeLine(`  ${escapeHtml(script.name)} <span class="${label}">exit ${result.status}</span> (${result.steps} statements)`);
+            if (result.error) writeLine(`    ${escapeHtml(result.error.split('\n')[0])}`, 't-warn');
+          }
+
+          apkState.installed.set(name, { version: entry.version, files: report.installed.length });
+          writeLine(`installed <span class="t-ok">${escapeHtml(name)}-${escapeHtml(entry.version)}</span>`, 't-ok');
+
+          const missing = report.info.depends.filter((dependency) => {
+            const parsed = describeDependency(dependency);
+            return parsed.kind === 'package' && !apkState.installed.has(parsed.name);
+          });
+          if (missing.length) {
+            writeLine(`  unresolved dependencies: ${escapeHtml(missing.join(' '))}`, 't-warn');
+          }
+        } catch (error) {
+          apkState.lastError = error.message;
+          writeBlock(error.message, 'block--error');
+        }
+      }
+    });
+    return;
+  }
+
+  writeLine(`apk: unknown command '${escapeHtml(sub)}'. Try:  apk help`, 't-err');
+}
+
+/** Run a callback, downloading the index first when it is missing. */
+async function withIndex(callback) {
+  try { await ensureIndex(); }
+  catch (error) {
+    apkState.lastError = error.message;
+    writeBlock(error.message, 'block--error');
+    return;
+  }
+  await callback();
+}
+
+function printApkHelp() {
+  writeLine('<span class="t-ok">apk</span> - Alpine package manager (real packages, verified locally)');
+  writeLine('');
+  for (const [name, usage] of Object.entries(APK_USAGE)) {
+    writeLine(`  <span class="t-dir">${escapeHtml(usage.padEnd(34))}</span>${escapeHtml(APK_DESCRIPTIONS[name])}`);
+  }
+  writeLine('');
+  writeLine('Every download is checked twice: the repository index signature, then the');
+  writeLine('package signature and per-file checksums. A proxy that alters bytes is');
+  writeLine('detected, so an untrusted CORS proxy is safe to use.');
+  writeLine('');
+  writeLine('Examples:');
+  writeLine('  <span class="t-dim">apk proxy https://api.allorigins.win/raw?url=%s</span>');
+  writeLine('  <span class="t-dim">apk update</span>');
+  writeLine('  <span class="t-dim">apk search editor</span>');
+  writeLine('  <span class="t-dim">apk add alpine-conf</span>');
+  writeLine('  <span class="t-dim">run /usr/sbin/lbu --help</span>');
+}
+
+
+/* ---------------------------------------------------------------------
+   10. Simulator control commands (ai, model)
    ------------------------------------------------------------------ */
 async function handleControlCommand(tokens) {
   const command = tokens[0].toLowerCase();
@@ -1314,17 +4177,99 @@ async function handleControlCommand(tokens) {
     return;
   }
 
+  if (command === 'shell') {
+    writeLine('POSIX shell interpreter. Run a script or a one-liner:');
+    writeLine('  <span class="t-dim">sh -c "for f in /etc/*; do echo $f; done"</span>');
+    writeLine('  <span class="t-dim">sh -c "echo hello | tr a-z A-Z"</span>');
+    writeLine('  <span class="t-dim">run /usr/sbin/lbu --help</span>');
+    return;
+  }
+
   if (command === 'reset') {
     VFS.children = cloneVfs(FACTORY_IMAGE).children;
     state.cwd = [];
+    apkState.installed.clear();
     writeLine('File system reset to the factory image.', 't-ok');
   }
 }
 
-const CONTROL_COMMANDS = ['ai', 'model', 'vfs', 'tree', 'reset'];
+const CONTROL_COMMANDS = ['ai', 'model', 'vfs', 'tree', 'reset', 'shell'];
+
+/**
+ * Split a command line on top-level `&&`, `||` and `;`, honouring quotes.
+ * Returns the segments in order together with the operator that precedes each
+ * one, so the router can decide whether a segment should run at all.
+ */
+function splitChain(input) {
+  const segments = [];
+  let current = '';
+  let quote = '';
+  let operator = '';
+
+  const flush = () => {
+    const text = current.trim();
+    if (text !== '') segments.push({ operator, text });
+    current = '';
+  };
+
+  for (let index = 0; index < input.length; index++) {
+    const character = input[index];
+
+    if (quote) {
+      current += character;
+      if (character === quote) quote = '';
+      continue;
+    }
+    if (character === '"' || character === "'") { quote = character; current += character; continue; }
+    if (character === '\\') { current += character + (input[index + 1] ?? ''); index++; continue; }
+
+    const pair = input.slice(index, index + 2);
+    if (pair === '&&' || pair === '||') {
+      flush();
+      operator = pair;
+      index++;
+      continue;
+    }
+    if (character === ';') { flush(); operator = ';'; continue; }
+    current += character;
+  }
+  flush();
+  return segments;
+}
+
+/** Run every segment of a chain in order, respecting `&&` and `||`. */
+async function runChain(input) {
+  const segments = splitChain(input);
+  if (segments.length <= 1) return false;
+
+  let status = 0;
+  for (const segment of segments) {
+    if (segment.operator === '&&' && status !== 0) continue;
+    if (segment.operator === '||' && status === 0) continue;
+    status = await runSegment(segment.text);
+  }
+  return true;
+}
+
+/** Run one already-split command line through the control, native and AI routes. */
+async function runSegment(input) {
+  const tokens = tokenize(input);
+  const head = (tokens[0] ?? '').toLowerCase();
+  if (head === '') return 0;
+
+  if (CONTROL_COMMANDS.includes(head)) { await handleControlCommand(tokens); return 0; }
+
+  const normalizedHead = VERB_ALIASES[head] ?? head;
+  if (isNativeKeyword(head)) {
+    return await applyNative([normalizedHead, ...tokens.slice(1)], { echoPrompt: false });
+  }
+
+  await runNaturalLanguage(input);
+  return 0;
+}
 
 /* ---------------------------------------------------------------------
-   9. Router
+   11. Router
    ------------------------------------------------------------------ */
 async function submit(rawInput) {
   if (state.busy) return;
@@ -1339,26 +4284,13 @@ async function submit(rawInput) {
   if (input === '') { setPrompt(); scrollToBottom(); focusInput(); return; }
   pushHistory(input);
 
-  const tokens = tokenize(input);
-  const head = tokens[0].toLowerCase();
-
   state.busy = true;
   setBusyPrompt();
 
   try {
-    if (CONTROL_COMMANDS.includes(head)) {
-      await handleControlCommand(tokens);
-      return;
-    }
+    if (await runChain(input)) return;
 
-    const normalizedHead = VERB_ALIASES[head] ?? head;
-
-    if (isNativeKeyword(head)) {
-      applyNative([normalizedHead, ...tokens.slice(1)], { echoPrompt: false });
-      return;
-    }
-
-    await runNaturalLanguage(input);
+    await runSegment(input);
   } catch (error) {
     writeBlock(`bash: internal error: ${error?.message ?? error}`, 'block--error');
   } finally {
@@ -1370,7 +4302,7 @@ async function submit(rawInput) {
 }
 
 /* ---------------------------------------------------------------------
-   10. Boot
+   12. Boot
    ------------------------------------------------------------------ */
 /**
  * Check for a usable WebGPU device. navigator.gpu can exist while no adapter is
@@ -1400,8 +4332,11 @@ function printBanner() {
   writeLine('');
   writeLine(`<span class="t-warn">[!]</span> This is a simulator. The file system lives in JavaScript and resets on reload.`);
   writeLine('');
-  writeLine('Run <span class="t-dir">help</span> for commands. Type plain English for the Kernel AI, for example:');
-  writeLine('  <span class="t-dim">create a folder called invoices</span>');
+  writeLine('Run <span class="t-dir">help</span> for commands. Three engines are available:');
+  writeLine('  <span class="t-dim">ls -la</span>                              native Bash, instant');
+  writeLine('  <span class="t-dim">sh -c "for f in /etc/*; do echo $f; done"</span>  a real POSIX shell interpreter');
+  writeLine('  <span class="t-dim">apk add alpine-conf</span>                  real Alpine packages, signature verified locally');
+  writeLine('  <span class="t-dim">create a folder called invoices</span>      plain English, compiled by the local model');
   writeLine('');
 }
 

@@ -1,0 +1,17 @@
+{
+  "name": "terminal-in-browser",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "A single-file Ubuntu 26.04 LTS terminal simulator that speaks Bash, POSIX shell, real Alpine packages and plain English.",
+  "scripts": {
+    "test": "node engine.test.mjs && node shell.test.mjs && node e2e.test.mjs",
+    "test:engine": "node engine.test.mjs",
+    "test:shell": "node shell.test.mjs",
+    "test:e2e": "node e2e.test.mjs",
+    "serve": "python3 -m http.server 12000"
+  },
+  "devDependencies": {
+    "jsdom": "^24.0.0"
+  }
+}
