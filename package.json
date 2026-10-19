@@ -12,6 +12,6 @@
     "serve": "python3 -m http.server 12000"
   },
   "devDependencies": {
-    "jsdom": "^24.0.0"
+    "jsdom": "^30.0.0"
   }
 }

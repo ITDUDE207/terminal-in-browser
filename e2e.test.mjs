@@ -1,8 +1,14 @@
 // End-to-end test: load the real index.html in jsdom, drive the real router.
 import { readFileSync, existsSync } from 'node:fs';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { JSDOM, VirtualConsole } from 'jsdom';
+import { ensureFixtures } from './fetch-fixtures.mjs';
 
-const RAW_HTML = readFileSync('/workspace/project/terminal-in-browser/index.html', 'utf8');
+await ensureFixtures();
+const FIXTURE_DIR = join(dirname(fileURLToPath(import.meta.url)), 'fixtures');
+
+const RAW_HTML = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'index.html'), 'utf8');
 
 // jsdom does not execute ES module scripts, so run the same code as a classic
 // script. The only module-specific syntax is the dynamic import for WebLLM,
@@ -23,14 +29,20 @@ const dom = new JSDOM(HTML, {
   runScripts: 'dangerously',
   pretendToBeVisual: true,
   url: 'https://localhost/index.html',
-  virtualConsole
+  virtualConsole,
+  // Older jsdom releases ship neither TextDecoder nor TextEncoder on the window.
+  // A real browser has both, so provide the Node implementations before boot.
+  beforeParse(win) {
+    for (const name of ['TextDecoder', 'TextEncoder', 'DecompressionStream', 'CompressionStream', 'Response', 'Request', 'Headers', 'Blob', 'structuredClone']) {
+      if (!(name in win)) win[name] = globalThis[name];
+    }
+    // The page probes WebGPU at boot. Report it as missing, like a headless browser.
+    Object.defineProperty(win.navigator, 'gpu', { value: undefined, configurable: true });
+    win.__stubWebllm = async () => { throw new Error('WebGPU is unavailable in this test'); };
+  }
 });
 
 const { window } = dom;
-
-// The page probes WebGPU at boot. Report it as missing, like a headless browser.
-Object.defineProperty(window.navigator, 'gpu', { value: undefined, configurable: true });
-window.__stubWebllm = async () => { throw new Error('WebGPU is unavailable in this test'); };
 
 // Serve real package bytes instead of the network, and record requested urls.
 const requested = [];
@@ -38,9 +50,9 @@ window.fetch = async (url) => {
   const name = String(url).split('/').pop().split('?')[0];
   requested.push(name);
   const map = {
-    'APKINDEX.tar.gz': '/tmp/apkwork/APKINDEX.tar.gz',
-    'busybox-1.37.0-r31.apk': '/tmp/apkwork/busybox.apk',
-    'alpine-conf-3.22.0-r0.apk': '/tmp/apkwork/conf.apk'
+    'APKINDEX.tar.gz': join(FIXTURE_DIR, 'APKINDEX.tar.gz'),
+    'busybox-1.37.0-r31.apk': join(FIXTURE_DIR, 'busybox-1.37.0-r31.apk'),
+    'alpine-conf-3.22.0-r0.apk': join(FIXTURE_DIR, 'alpine-conf-3.22.0-r0.apk')
   };
   const path = map[name];
   if (!path || !existsSync(path)) return { ok: false, status: 404 };
